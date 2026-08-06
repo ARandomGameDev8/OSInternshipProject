@@ -28,6 +28,7 @@ import sys
 import time
 import math
 import signal
+import select
 import argparse
 import logging
 import psutil
@@ -98,25 +99,20 @@ def get_max_ram(pid: int) -> int:
     Return the hard RAM ceiling (in KB) for the given PID.
 
     On Linux: reads /proc/<pid>/limits for 'Max resident set' (RLIMIT_RSS).
-    RLIMIT_RSS is the actual RSS cap — unlike RLIMIT_AS which is virtual
-    address space, not physical RAM. The original code also ignored the pid
-    argument entirely and queried the monitor's own limits instead.
-    If the limit is 'unlimited', falls back to total system RAM which is the
-    true physical ceiling for any process.
+    If the limit is 'unlimited', falls back to total system RAM.
 
-    On Windows: /proc does not exist, falls back to total system RAM.
+    On Windows: falls back to total system RAM.
     """
     if sys.platform != "win32":
         try:
             with open(f"/proc/{pid}/limits", "r") as f:
                 for line in f:
                     if line.startswith("Max resident set"):
-                        # format: "Max resident set    <soft>    <hard>    bytes"
                         parts = line.split()
                         soft  = parts[3]
                         if soft != "unlimited":
                             return int(soft) // 1024   # bytes -> KB
-                        break   # unlimited -> fall through
+                        break
         except (FileNotFoundError, PermissionError, ValueError, IndexError):
             pass
 
@@ -125,13 +121,7 @@ def get_max_ram(pid: int) -> int:
 
 def partition_to_continious_rv(RAM_interval: list, num_bins: int = None):
     """
-    Partition [lower_kb, upper_kb] into non-overlapping ContiniousRandomVariable
-    bins. All bounds are in KB. Each bin's val (midpoint) is set by the now-fixed
-    ContiniousRandomVariable.__init__.
-
-    Uses log-spaced edges so resolution is highest at low RAM values (where most
-    processes spend most of their time) and coarser at the high end (rare spikes).
-    This matches the empirical shape of RSS distributions better than uniform bins.
+    Partition [lower_kb, upper_kb] into non-overlapping ContiniousRandomVariable bins.
     """
     lower_kb = RAM_interval[0]
     upper_kb = RAM_interval[1]
@@ -146,7 +136,6 @@ def partition_to_continious_rv(RAM_interval: list, num_bins: int = None):
     range_mb = range_kb / 1024
     range_gb = range_mb / 1024
 
-    # Smaller ranges get more bins for finer resolution.
     if num_bins is None:
         if range_gb < 1:
             if range_mb < 128:
@@ -169,8 +158,6 @@ def partition_to_continious_rv(RAM_interval: list, num_bins: int = None):
             log.error("partition_to_continious_rv: RAM range exceeds 128 GB")
             return None
 
-    # Log-spaced edges over [lower_kb, upper_kb].
-    # The +1/-1 shift avoids log(0) while keeping the first edge at lower_kb.
     log_min = math.log(1)
     log_max = math.log(range_kb + 1)
 
@@ -178,12 +165,9 @@ def partition_to_continious_rv(RAM_interval: list, num_bins: int = None):
         lower_kb + math.exp(log_min + (log_max - log_min) * i / num_bins) - 1
         for i in range(num_bins + 1)
     ]
-    edges[0]  = lower_kb   # force exact endpoints against float drift
+    edges[0]  = lower_kb
     edges[-1] = upper_kb
 
-    # ContiniousRandomVariable.__init__ is now fixed (double underscores),
-    # so lowerBound, upperBound and val (midpoint) are all set correctly
-    # by the constructor — no manual patching needed here.
     return [
         ContiniousRandomVariable(i, edges[i], edges[i + 1])
         for i in range(num_bins)
@@ -192,11 +176,6 @@ def partition_to_continious_rv(RAM_interval: list, num_bins: int = None):
 
 # ---------------------------------------------------------
 # FSM STATE 1 — Histogram
-#
-# Accumulates RSS samples into fixed bins for one process
-# over one WINDOW_DURATION window.
-# Bins are built once from RAM_max and never change.
-# Only the frequency counts reset between windows.
 # ---------------------------------------------------------
 
 class ProcessHistogram:
@@ -208,16 +187,13 @@ class ProcessHistogram:
         self.sample_count = 0
 
     def record(self, rss_kb: float):
-        """Bucket rss_kb into the correct bin and increment its frequency."""
         for i, crv in enumerate(self.bins):
             if crv.getLower() <= rss_kb < crv.getUpper():
                 self.frequency[i] += 1
                 return
-        # rss_kb == upper_kb exactly (edge case) -> last bin
         self.frequency[-1] += 1
 
     def reset_counts(self):
-        """Zero frequency counts for the next window. Bins stay fixed."""
         self.frequency    = [0] * len(self.bins)
         self.sample_count = 0
 
@@ -229,27 +205,16 @@ class ProcessHistogram:
 
 
 # ---------------------------------------------------------
-# FSM STATE 2 — Scatter accumulator
-#
-# Grows one (time_ns, ri) pair per completed window.
-# Each observation is stored as a ContiniousRandomVariable
-# with lowerBound == upperBound == val == the point value,
-# and frequency 1, which is what ContiniousDistribution and
-# ScatterPlot expect.
+# FSM STATE 2 — RAM Graph Data Container
 # ---------------------------------------------------------
 
 class ProcessRAM_Graph:
-    """
-    Accumulates (time_ns, ri) pairs across windows for one process.
-    Both are plain numbers — no distribution wrapper needed.
-    Plotted directly with matplotlib.
-    """
 
     def __init__(self, pid: int, name: str):
-        self.pid        = pid
-        self.proc_name  = name
-        self.time_points = []   # list[float]  — time_ns at end of each window
-        self.ri_points   = []   # list[float]  — mode_kb / RAM_max for that window
+        self.pid         = pid
+        self.proc_name   = name
+        self.time_points = []
+        self.ri_points    = []
 
     def add_point(self, time_ns: int, ri: float):
         self.time_points.append(float(time_ns))
@@ -259,11 +224,10 @@ class ProcessRAM_Graph:
         return len(self.time_points) > 0
 
     def plot(self):
-        """Plot ri vs time_ns directly — no distribution or ScatterPlot wrapper."""
         import matplotlib.pyplot as plt
 
         plt.figure(figsize=(10, 5))
-        plt.scatter(self.time_points, self.ri_points, color="blue", s=30)
+        plt.plot(self.time_points, self.ri_points, color="blue", linewidth=2, marker='o')
         plt.title(f"{self.proc_name} (PID {self.pid}) — RAM usage ratio over time")
         plt.xlabel("time (ns)")
         plt.ylabel("ri = mode_kb / RAM_max")
@@ -340,19 +304,206 @@ class ProcessFilter:
 
 
 # ---------------------------------------------------------
-# Monitor  —  two-state FSM per process
-#
-#   STATE 1  (HISTOGRAM)
-#     Each loop tick: record rss_kb into histogram, increment sample count.
-#     After SAMPLES_PER_WINDOW samples -> transition to STATE 2 same tick.
-#
-#   STATE 2  (SCATTER)
-#     Build ContiniousDistribution from histogram frequency counts.
-#     mode_kb  = dist.getMode()       <- midpoint of most-frequent bin, in KB
-#     ri       = mode_kb / RAM_max_kb <- normalized ratio in [0, 1]
-#     Append (time_ns, ri) to scatter accumulator.
-#     Reset histogram counts (bins stay fixed).
-#     -> back to STATE 1 immediately (same tick).
+# Command execution handler
+# ---------------------------------------------------------
+
+class Commands:
+
+    def __init__(self):
+        self.commFlags = {
+            "--l": self.showListPids,
+            "--lr": self.show_pids_ram,
+            "--lrmb": self.show_pids_ram_MB,
+            "--lrgb": self.show_pids_ram_GB,
+            "--io": self.show_pids_io,
+            "--iomb": self.show_pids_io_MB,
+            "--iogb": self.show_pids_io_GB,
+            "--read": self.show_pids_read,
+            "--readmb": self.show_pids_read_MB,
+            "--readgb": self.show_pids_read_GB,
+            "--write": self.show_pids_write,
+            "--writemb": self.show_pids_write_MB,
+            "--writegb": self.show_pids_write_GB,
+            "--lt": self.show_pids_threads,
+            "--lfd": self.show_pids_fd,
+        }
+
+        self.commRootList = {
+            "pids": self.show_pids,
+            "curr --tick": self.show_curr_tick,
+            "curr --tns": self.show_curr_tns,
+            "monitor --stop": self.stop_monitor,
+        }
+
+    def execute(self, cmd_str: str, latest_snapshots: dict, monitor=None):
+        cmd = cmd_str.strip()
+        if not cmd:
+            return
+
+        tokens = cmd.split()
+
+        if cmd == "monitor --stop":
+            self.stop_monitor(monitor)
+            return
+
+        # ---------------------------------------------------------
+        # monitor --live figshow command suite
+        # ---------------------------------------------------------
+        if cmd.startswith("monitor --live figshow"):
+            sub_tokens = tokens[3:]
+            target_pids = []
+            if not sub_tokens:
+                target_pids = list(latest_snapshots.keys())
+            elif sub_tokens[0].isdigit():
+                pid = int(sub_tokens[0])
+                if pid in latest_snapshots:
+                    target_pids = [pid]
+                else:
+                    print(f"PID {pid} is not currently monitored.")
+                    return
+            else:
+                target_name = sub_tokens[0].lower()
+                target_pids = [
+                    p for p, snap in latest_snapshots.items()
+                    if snap["name"].lower() == target_name
+                ]
+                if not target_pids:
+                    print(f"No monitored process found matching name '{sub_tokens[0]}'")
+                    return
+
+            monitor.show_live_figures(target_pids)
+            return
+
+        # ---------------------------------------------------------
+        # pids <pid> [--filter]
+        # ---------------------------------------------------------
+        if tokens[0] == "pids" and len(tokens) > 1 and tokens[1].isdigit():
+            target_pid = int(tokens[1])
+            if target_pid not in latest_snapshots:
+                print(f"PID {target_pid} not found in monitored snapshots.")
+                return
+
+            snapshot = latest_snapshots[target_pid]
+            if len(tokens) == 2:
+                self.show_pids(snapshot)
+            else:
+                flag = tokens[2]
+                if flag in self.commFlags:
+                    func = self.commFlags[flag]
+                    func(snapshot.get("pid") if flag == "--l" else snapshot)
+                else:
+                    print(f"Unknown flag: {flag}")
+            return
+
+        # ---------------------------------------------------------
+        # name <process_name> [--filter]
+        # ---------------------------------------------------------
+        if tokens[0] == "name" and len(tokens) > 1:
+            target_name = tokens[1].lower()
+            matching_snaps = [
+                snap for snap in latest_snapshots.values()
+                if snap["name"].lower() == target_name
+            ]
+            if not matching_snaps:
+                print(f"No monitored processes matching name '{tokens[1]}'")
+                return
+
+            flag = tokens[2] if len(tokens) > 2 else None
+            for snap in matching_snaps:
+                if not flag:
+                    self.show_pids(snap)
+                elif flag in self.commFlags:
+                    func = self.commFlags[flag]
+                    func(snap.get("pid") if flag == "--l" else snap)
+                else:
+                    print(f"Unknown flag: {flag}")
+                    break
+            return
+
+        # ---------------------------------------------------------
+        # Standard root commands across all snapshots
+        # ---------------------------------------------------------
+        if cmd in self.commRootList:
+            func = self.commRootList[cmd]
+            for snapshot in latest_snapshots.values():
+                func(snapshot)
+            return
+
+        # Direct flag execution across all snapshots (e.g., "pids --lr")
+        flag = cmd.replace("pids ", "").strip()
+        if flag in self.commFlags:
+            func = self.commFlags[flag]
+            for snapshot in latest_snapshots.values():
+                func(snapshot.get("pid") if flag == "--l" else snapshot)
+            return
+
+        print(f"Unknown command: {cmd_str}")
+
+    def show_pids(self, snapshot: dict):
+        retText = ""
+        for key, val in snapshot.items():
+            retText += f"{key}: {val}\n"
+        print(retText)
+
+    def showListPids(self, pid: int):
+        print(pid)
+
+    def show_pids_ram(self, snapshot: dict):
+        print(f"{snapshot['pid']} ({snapshot['name']}) ram: {snapshot['rss_kb']} KB")
+
+    def show_pids_ram_MB(self, snapshot: dict):
+        print(f"{snapshot['pid']} ({snapshot['name']}) ram: {snapshot['rss_kb'] / 1024:.2f} MB")
+
+    def show_pids_ram_GB(self, snapshot: dict):
+        print(f"{snapshot['pid']} ({snapshot['name']}) ram: {(snapshot['rss_kb'] / 1024) / 1024:.4f} GB")
+
+    def show_pids_io(self, snapshot: dict):
+        print(f"{snapshot['pid']} read: {snapshot['io_read_kb']} KB, write: {snapshot['io_write_kb']} KB")
+
+    def show_pids_io_MB(self, snapshot: dict):
+        print(f"{snapshot['pid']} read: {snapshot['io_read_kb'] / 1024:.2f} MB, write: {snapshot['io_write_kb'] / 1024:.2f} MB")
+
+    def show_pids_io_GB(self, snapshot: dict):
+        print(f"{snapshot['pid']} read: {(snapshot['io_read_kb'] / 1024) / 1024:.4f} GB, write: {(snapshot['io_write_kb'] / 1024) / 1024:.4f} GB")
+
+    def show_pids_read(self, snapshot: dict):
+        print(f"{snapshot['pid']} read: {snapshot['io_read_kb']} KB")
+
+    def show_pids_read_MB(self, snapshot: dict):
+        print(f"{snapshot['pid']} read: {snapshot['io_read_kb'] / 1024:.2f} MB")
+
+    def show_pids_read_GB(self, snapshot: dict):
+        print(f"{snapshot['pid']} read: {(snapshot['io_read_kb'] / 1024) / 1024:.4f} GB")
+
+    def show_pids_write(self, snapshot: dict):
+        print(f"{snapshot['pid']} write: {snapshot['io_write_kb']} KB")
+
+    def show_pids_write_MB(self, snapshot: dict):
+        print(f"{snapshot['pid']} write: {snapshot['io_write_kb'] / 1024:.2f} MB")
+
+    def show_pids_write_GB(self, snapshot: dict):
+        print(f"{snapshot['pid']} write: {(snapshot['io_write_kb'] / 1024) / 1024:.4f} GB")
+
+    def show_pids_threads(self, snapshot: dict):
+        print(f"{snapshot['pid']} threads: {snapshot['threads']}")
+
+    def show_pids_fd(self, snapshot: dict):
+        print(f"{snapshot['pid']} handles/fd: {snapshot['fd_count']}")
+
+    def show_curr_tick(self, snapshot: dict):
+        print(f"{snapshot['pid']} cpu ticks: {snapshot['cpu_ticks']}")
+
+    def show_curr_tns(self, snapshot: dict):
+        print(f"{snapshot['pid']} timestamp ns: {snapshot['timestamp_ns']}")
+
+    def stop_monitor(self, monitor):
+        if monitor:
+            monitor.stop()
+            log.info("Monitor stopped via command")
+
+
+# ---------------------------------------------------------
+# Monitor — two-state FSM per process
 # ---------------------------------------------------------
 
 STATE_HISTOGRAM = 1
@@ -366,19 +517,18 @@ class Monitor:
         self.previous_cpu = {}
         self.data         = {}
         self.running      = True
+        self.commands     = Commands()
 
         self.target_pids  = filt.get_target_pids()
         if not self.target_pids:
             log.warning("No target processes found")
 
-        # All per-pid structures initialized lazily on first snapshot
-        self.fsm_state  = {}   # pid -> STATE_HISTOGRAM | STATE_SCATTER
-        self.ram_max    = {}   # pid -> int (KB), fixed for the session
-        self.histograms = {}   # pid -> ProcessHistogram
-        self.RAM_graph   = {}   # pid -> ProcessScatter
+        self.fsm_state  = {}
+        self.ram_max    = {}
+        self.histograms = {}
+        self.RAM_graph   = {}
 
     def _init_pid(self, pid: int, name: str) -> bool:
-        """Initialize all per-pid structures on first snapshot for this pid."""
         ram_max_kb = get_max_ram(pid)
         bins       = partition_to_continious_rv([0, ram_max_kb])
         if bins is None:
@@ -394,22 +544,17 @@ class Monitor:
         return True
 
     def _finalize_window(self, pid: int):
-        """
-        STATE 2: build distribution from the completed window's frequency counts,
-        extract mode, compute ri, append scatter point, reset histogram, return
-        to STATE 1. Runs on the same tick as the transition from STATE 1.
-        """
         hist = self.histograms[pid]
 
         dist = ContiniousDistribution(
             f"RAM histogram PID {pid}",
             hist.bins,
-            hist.frequency[:]   # copy so the upcoming reset does not corrupt dist
+            hist.frequency[:]
         )
 
-        mode_kb    = dist.getMode()           # midpoint of the most-frequent bin (KB)
+        mode_kb    = dist.getMode()
         ram_max_kb = self.ram_max[pid]
-        ri         = mode_kb / ram_max_kb     # normalized ratio in [0, 1]
+        ri         = mode_kb / ram_max_kb
         ts         = time.time_ns()
 
         self.RAM_graph[pid].add_point(ts, ri)
@@ -417,11 +562,96 @@ class Monitor:
         hist.reset_counts()
         self.fsm_state[pid] = STATE_HISTOGRAM
 
+    def show_live_figures(self, target_pids: list):
+        """Displays live line graphs of ri vs time_ns for target processes."""
+        import matplotlib.pyplot as plt
+        from matplotlib.widgets import Button
+
+        if not target_pids:
+            print("No processes selected for live view.")
+            return
+
+        page_size = 3
+        current_page = [0]
+        total_pages = math.ceil(len(target_pids) / page_size)
+
+        fig, axes = plt.subplots(3, 1, figsize=(10, 8))
+        if page_size == 1:
+            axes = [axes]
+        plt.subplots_adjust(bottom=0.15)
+
+        def update_plots():
+            start_idx = current_page[0] * page_size
+            page_pids = target_pids[start_idx:start_idx + page_size]
+
+            for ax in axes:
+                ax.clear()
+
+            for i, pid in enumerate(page_pids):
+                ax = axes[i]
+                graph = self.RAM_graph.get(pid)
+                if graph and graph.has_data():
+                    # Plot continuous line graph over time_ns with point markers
+                    ax.plot(graph.time_points, graph.ri_points, color="blue", linewidth=1.8, marker="o", markersize=4)
+                    ax.set_title(f"{graph.proc_name} (PID {pid}) — ri (mode_kb / RAM_max) vs time_ns")
+                else:
+                    proc_name = get_process_name(pid) or "Process"
+                    ax.set_title(f"{proc_name} (PID {pid}) — Waiting for window data...")
+
+                ax.set_xlabel("time (ns)")
+                ax.set_ylabel("ri")
+                ax.set_ylim(0, 1)
+                ax.grid(True)
+
+            # Clear unused axes on the page if less than 3 processes remaining
+            for j in range(len(page_pids), 3):
+                axes[j].clear()
+                axes[j].axis('off')
+
+            fig.suptitle(f"Live Line Monitor — Page {current_page[0] + 1} of {total_pages}", fontsize=12)
+            fig.canvas.draw_idle()
+
+        # Navigation controls for pagination
+        ax_prev = plt.axes([0.7, 0.02, 0.1, 0.05])
+        ax_next = plt.axes([0.81, 0.02, 0.1, 0.05])
+        btn_prev = Button(ax_prev, 'Previous')
+        btn_next = Button(ax_next, 'Next')
+
+        def prev_page(event):
+            if current_page[0] > 0:
+                current_page[0] -= 1
+                update_plots()
+
+        def next_page(event):
+            if current_page[0] < total_pages - 1:
+                current_page[0] += 1
+                update_plots()
+
+        btn_prev.on_clicked(prev_page)
+        btn_next.on_clicked(next_page)
+
+        update_plots()
+        plt.show(block=False)
+
+    def _check_console_input(self, latest_snapshots: dict):
+        if sys.platform != "win32":
+            if select.select([sys.stdin], [], [], 0)[0]:
+                line = sys.stdin.readline()
+                if line:
+                    self.commands.execute(line.strip(), latest_snapshots, self)
+        else:
+            import msvcrt
+            if msvcrt.kbhit():
+                line = sys.stdin.readline()
+                if line:
+                    self.commands.execute(line.strip(), latest_snapshots, self)
+
     def loop(self, interval: float):
+        latest_snapshots = {}
         while self.running:
             current_time = time.time_ns()
 
-            for pid in self.target_pids:
+            for pid in list(self.target_pids):
                 if not psutil.pid_exists(pid):
                     if pid in self.previous_cpu:
                         log.info(f"Process {pid} has terminated")
@@ -432,12 +662,12 @@ class Monitor:
                 if not snapshot:
                     continue
 
-                # Lazy init on first encounter
+                latest_snapshots[pid] = snapshot
+
                 if pid not in self.fsm_state:
                     if not self._init_pid(pid, snapshot["name"]):
                         continue
 
-                # CPU %
                 old = self.previous_cpu.get(pid)
                 if old:
                     delta_cpu  = snapshot["cpu_ticks"] - old["cpu_ticks"]
@@ -452,24 +682,22 @@ class Monitor:
                 self.previous_cpu[pid] = snapshot
                 self.data.setdefault(pid, []).append(snapshot)
 
-                # STATE 1: record sample into histogram
                 if self.fsm_state[pid] == STATE_HISTOGRAM:
                     self.histograms[pid].record(snapshot["rss_kb"])
                     self.histograms[pid].increment_sample()
                     if self.histograms[pid].is_window_complete():
                         self.fsm_state[pid] = STATE_SCATTER
 
-                # STATE 2: finalize window, reset, return to STATE 1 (same tick)
                 if self.fsm_state[pid] == STATE_SCATTER:
                     self._finalize_window(pid)
 
+            self._check_console_input(latest_snapshots)
             time.sleep(interval)
 
     def stop(self):
         self.running = False
 
     def show_scatter(self, pid: int):
-        """Display the scatter plot for a pid. Call after monitoring ends."""
         if pid not in self.RAM_graph or not self.RAM_graph[pid].has_data():
             log.warning(
                 f"PID={pid}: no scatter data yet — need at least one full "
