@@ -1,5 +1,5 @@
 from Documents.STATS.Univariate.Distributions import DiscreteDistribution
-from Documents.STATS.Univariate.Distributions import ContinuousDistribution
+from Documents.STATS.Univariate.Distributions import ContiniousDistribution
 from Documents.STATS.RandomVariable import RandomVariable
 import matplotlib.pyplot as plt
 import numpy as np
@@ -7,27 +7,18 @@ import numpy as np
 
 class ScatterPlot:
 
-    def __init__(self, name: str,
-                 X: DiscreteDistribution,
-                 Y: DiscreteDistribution):
-
+    def __init__(self, name: str, X, Y):
+        if not isinstance(X, (DiscreteDistribution, ContiniousDistribution)):
+            raise TypeError("X must be a DiscreteDistribution or ContinuousDistribution")
+        if not isinstance(Y, (DiscreteDistribution, ContiniousDistribution)):
+            raise TypeError("Y must be a DiscreteDistribution or ContinuousDistribution")
         if len(X.random_variables) != len(Y.random_variables):
             raise ValueError("X and Y must contain the same number of observations.")
-
+ 
         self.name = name
-        self.X = X
-        self.Y = Y
-
-    # -------------------------
-    # Basic Statistics
-    # -------------------------
-    def __init__(self, name:str, X:ContinuousDistribution, Y:ContinuousDistribution):
-        self.name = name
-        self.X = X
-        self.Y = Y
-        if len(X.random_variables) != len(Y.random_variables):
-             raise ValueError("X and Y must contain the same number of observations.")
-
+        self.X    = X
+        self.Y    = Y
+    
     def getMeanX(self):
         return self.X.getMean()
 
@@ -156,19 +147,20 @@ class ScatterPlot:
         
         
 class DiscreteFrequencyTable:
-    def __init__(self, name:str, X:DiscreteDistribution, Y:DiscreteDistribution, frequency = []):
-        self.name = name
-        self.X = X
-        self.Y = Y
-        if len(X.random_variables) != len(Y.random_variables):
-            raise ValueError("X and Y must contain the same number of observations.")
-    def __init__(self, name:str, X:ContinuousDistribution, Y:ContinuousDistribution, frequency:list):
-        self.name = name
-        self.X = X   
-        self.Y = Y
-        if len(X.random_variables) != len(Y.random_variables):
-            raise ValueError("X and Y must contain the same number of observations.")   
-        self.frequency = frequency
+        def __init__(self, name :str, X, Y, frequency: list = None):
+            if not isinstance(X, (DiscreteDistribution, ContiniousDistribution)):
+                raise TypeError("X must be a DiscreteDistribution ot ContiniousDistribution")
+            if not isinstance(Y, (DiscreteDistribution, ContiniousDistribution)):
+                raise TypeError("X must be a DiscreteDistribution ot ContiniousDistribution")
+            if len(X.random_variables) != len(Y.random_variables):
+                raise ValueError("X and Y must contain the same number of observations.")
+            self.name = name
+            self.X = X
+            self.Y = Y
+            self.frequency = frequency if frequency is not None else []
+                
+            
+            
         
         
         def getMeanX(self):

@@ -9,12 +9,12 @@ class RandomVariable:
     def setName(self, name:str):
         self.name = name
     def setVal(self, val):
-         self.valList = val
+         self.val = val
          
     def getName(self): 
         return self.name
     def getVal(self):
-        return self.valList
+        return self.val
   
     
   
