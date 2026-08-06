@@ -238,7 +238,7 @@ class ProcessHistogram:
 # ScatterPlot expect.
 # ---------------------------------------------------------
 
-class ProcessScatter:
+class ProcessRAM_Graph:
     """
     Accumulates (time_ns, ri) pairs across windows for one process.
     Both are plain numbers — no distribution wrapper needed.
@@ -375,7 +375,7 @@ class Monitor:
         self.fsm_state  = {}   # pid -> STATE_HISTOGRAM | STATE_SCATTER
         self.ram_max    = {}   # pid -> int (KB), fixed for the session
         self.histograms = {}   # pid -> ProcessHistogram
-        self.scatters   = {}   # pid -> ProcessScatter
+        self.RAM_graph   = {}   # pid -> ProcessScatter
 
     def _init_pid(self, pid: int, name: str) -> bool:
         """Initialize all per-pid structures on first snapshot for this pid."""
@@ -387,13 +387,10 @@ class Monitor:
 
         self.ram_max[pid]    = ram_max_kb
         self.histograms[pid] = ProcessHistogram(pid, bins)
-        self.scatters[pid]   = ProcessScatter(pid, name)
+        self.RAM_graph[pid]   = ProcessRAM_Graph(pid, name)
         self.fsm_state[pid]  = STATE_HISTOGRAM
 
-        log.info(
-            "PID=%d (%s) initialized: RAM_max=%d KB, %d bins",
-            pid, name, ram_max_kb, len(bins)
-        )
+        log.info("Monitoring PID %d (%s)", pid, name)
         return True
 
     def _finalize_window(self, pid: int):
@@ -415,12 +412,7 @@ class Monitor:
         ri         = mode_kb / ram_max_kb     # normalized ratio in [0, 1]
         ts         = time.time_ns()
 
-        self.scatters[pid].add_point(ts, ri)
-
-        log.info(
-            "PID=%d window done — mode=%.1f KB  RAM_max=%d KB  ri=%.4f  scatter points=%d",
-            pid, mode_kb, ram_max_kb, ri, len(self.scatters[pid].time_points)
-        )
+        self.RAM_graph[pid].add_point(ts, ri)
 
         hist.reset_counts()
         self.fsm_state[pid] = STATE_HISTOGRAM
@@ -471,16 +463,6 @@ class Monitor:
                 if self.fsm_state[pid] == STATE_SCATTER:
                     self._finalize_window(pid)
 
-                log.info(
-                    "PID=%d %-20s RAM=%d KB  CPU=%.2f%%  [sample %d/%d]",
-                    pid,
-                    snapshot["name"],
-                    snapshot["rss_kb"],
-                    snapshot["cpu_percent"],
-                    self.histograms[pid].sample_count,
-                    SAMPLES_PER_WINDOW,
-                )
-
             time.sleep(interval)
 
     def stop(self):
@@ -488,13 +470,13 @@ class Monitor:
 
     def show_scatter(self, pid: int):
         """Display the scatter plot for a pid. Call after monitoring ends."""
-        if pid not in self.scatters or not self.scatters[pid].has_data():
+        if pid not in self.RAM_graph or not self.RAM_graph[pid].has_data():
             log.warning(
                 f"PID={pid}: no scatter data yet — need at least one full "
                 f"{WINDOW_DURATION}s window"
             )
             return
-        self.scatters[pid].plot()
+        self.RAM_graph[pid].plot()
 
 
 # ---------------------------------------------------------
@@ -528,9 +510,8 @@ def main():
     )
 
     def handle_stop(s, f):
+        log.info("Stopping monitor...")
         monitor.stop()
-        for pid in monitor.target_pids:
-            monitor.show_scatter(pid)
 
     signal.signal(signal.SIGINT, handle_stop)
     if hasattr(signal, 'SIGTERM'):
