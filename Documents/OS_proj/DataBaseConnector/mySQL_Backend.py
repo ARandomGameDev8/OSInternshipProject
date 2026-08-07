@@ -1024,3 +1024,13 @@ class Database:
         """
 
         return self._execute_select(query)
+    
+    
+    
+def test():
+    print("attempting to connect to database")
+    base = Database()
+    base.close()
+    print("closed with  no errors")
+    
+test()
