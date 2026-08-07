@@ -32,9 +32,14 @@ import select
 import argparse
 import logging
 import psutil
+import mysql.connector
+from mysql.connector import Error
 
 from Documents.OS_proj.STATS.ContiniousRandomVariable import ContiniousRandomVariable
 from Documents.STATS.Univariate.Distributions import ContiniousDistribution
+from Documents.OS_proj.DataBaseConnector.mySQL_Backend import Database
+
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -508,6 +513,7 @@ class Commands:
 
 STATE_HISTOGRAM = 1
 STATE_SCATTER   = 2
+STATE_MEMORY = 3
 
 
 class Monitor:
@@ -523,10 +529,23 @@ class Monitor:
         if not self.target_pids:
             log.warning("No target processes found")
 
-        self.fsm_state  = {}
-        self.ram_max    = {}
-        self.histograms = {}
-        self.RAM_graph   = {}
+        self.fsm_state  = {} # each pid-> FSM 
+        self.ram_max    = {} # each pid -> mode
+        self.histograms = {} # each pid -> histogram
+        self.RAM_graph   = {} # each pid -> RAM_graph
+        self.database = None
+        
+    def _init_database(self):
+        try:
+            self.database = Database()
+            return True
+        except Error as e:
+            print("there was a error connecting to the database. Long term memory saving is disabled")
+            return False
+            
+        
+        
+        
 
     def _init_pid(self, pid: int, name: str) -> bool:
         ram_max_kb = get_max_ram(pid)
@@ -648,6 +667,7 @@ class Monitor:
 
     def loop(self, interval: float):
         latest_snapshots = {}
+        
         while self.running:
             current_time = time.time_ns()
 
