@@ -1,6 +1,6 @@
-from Documents.STATS.Univariate.Distributions import DiscreteDistribution
-from Documents.STATS.Univariate.Distributions import ContiniousDistribution
-from Documents.STATS.RandomVariable import RandomVariable
+from Documents.OS_proj.STATS.Univariate.Distributions import ContiniousDistribution
+from Documents.OS_proj.STATS.Univariate.Distributions import DiscreteDistribution
+from Documents.OS_proj.STATS.RandomVariable import RandomVariable
 import matplotlib.pyplot as plt
 import numpy as np
 

@@ -1,11 +1,11 @@
 
-from Documents.STATS.RandomVariable import RandomVariable
-from Documents.STATS.ContinuousRandomVariable import ContinuousRandomVariable
-from Documents.STATS.DiscreteRandomVariable import DiscreteRandomVariable
+from Documents.OS_proj.STATS.ContiniousRandomVariable import ContiniousRandomVariable
+from Documents.OS_proj.STATS.DiscreteRandomVariable import DiscreteRandomVariable
+from Documents.OS_proj.STATS.RandomVariable import RandomVariable
 import matplotlib.pyplot as plt
 
 class ContiniousDistribution:
-    def __init__(self, name:str, random_variables: list[ContinuousRandomVariable], frequency:  list[float]):
+    def __init__(self, name:str, random_variables: list[ContiniousRandomVariable], frequency:  list[float]):
         self.name = name
         self.random_variables = random_variables
         self.frequency = frequency
@@ -54,25 +54,37 @@ class ContiniousDistribution:
         
             
     def GraphDistribution(self):
-        x = [rv.getVal() for rv in self.random_variables]
-        useDensity = False
-        constWidth = self.random_variables[0].upperBound - self.random_variables[0].lowerBound
-        for i in range(len(self.random_variables)):
-            if (self.random_variables[i].upperBound - self.random_variables[i].lowerBound) != constWidth:
-                useDensity = True
-                break
-            
-        if useDensity:
-            y = self.ConvertProbabilitytoDensity()
-        else:
-            y = self.ConvertFrequencyToProbability()
 
-        plt.bar(x, y)
-        plt.xlabel('Random Variables')
-        plt.ylabel('Frequency')
-        plt.title(f'Distribution: {self.name}')
+        widths = [
+            rv.upperBound - rv.lowerBound
+            for rv in self.random_variables
+        ]
+
+        probabilities = self.ConvertFrequencyToProbability()
+
+        densities = [
+            p / w
+            for p, w in zip(probabilities, widths)
+        ]
+
+        left_edges = [
+            rv.lowerBound
+            for rv in self.random_variables
+        ]
+
+        plt.bar(
+            left_edges,
+            densities,
+            width=widths,
+            align="edge",
+            edgecolor="black"
+        )
+
+        plt.xlabel("X")
+        plt.ylabel("Density")
+        plt.title(f"Continuous Distribution: {self.name}")
+
         plt.show()
-    
 
             
 class DiscreteDistribution:
@@ -116,11 +128,29 @@ class DiscreteDistribution:
    
    
     def GraphDistribution(self):
+    
+
+    
         x = [rv.getVal() for rv in self.random_variables]
-        y = self.frequency
-        plt.bar(x, y)
-        plt.xlabel('Random Variables')
-        plt.ylabel('Frequency')
-        plt.title(f'Distribution: {self.name}')
-        plt.show()
+
+
+        total_frequency = sum(self.frequency)
+        y = [
+            freq / total_frequency
+            for freq in self.frequency
+        ]
+
  
+        plt.figure(figsize=(8, 5))
+
+        plt.stem(
+              x,
+              y
+         )
+
+        plt.xlabel("Random Variable Value (X)")
+        plt.ylabel("Probability P(X=x)")
+        plt.title(f"Probability Distribution: {self.name}")
+
+        plt.grid(True)
+        plt.show()
