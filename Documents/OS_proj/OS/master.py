@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 
 """
-master.py — Process monitor with main-thread Matplotlib rendering,
-child-process tracking, dynamic tiered range histogram binning,
-trading-style dynamic DB date-time axis scaling, and explicit 'close_event' cleanup.
+master.py — Native Windows ETW Process Monitor with 6-subplot live GUI 
+rendering per PID (Size, Velocity, Acceleration for allocations and deallocations),
+dynamic tiered range histogram binning, and MySQL persistence.
 """
 
 import os
-import gc
+
 import sys
 import time
 import math
@@ -21,6 +21,9 @@ from mysql.connector import Error
 
 import psutil
 import matplotlib.dates as mdates
+
+# Native Windows ETW Integration
+import etw
 
 from Documents.OS_proj.STATS.ContiniousRandomVariable import ContiniousRandomVariable
 from Documents.OS_proj.STATS.DiscreteRandomVariable import DiscreteRandomVariable
@@ -45,21 +48,18 @@ logging.basicConfig(
 
 log = logging.getLogger("master")
 
-try:
-    PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
-except (AttributeError, ValueError):
-    PAGE_SIZE = 4096
-
 # ---------------------------------------------------------
 # Window / refresh constants
 # ---------------------------------------------------------
 
-SAMPLING_INTERVAL     = 1.0                                        # seconds between RSS reads
-WINDOW_DURATION       = 30                                         # seconds per histogram window
-SAMPLES_PER_WINDOW    = int(WINDOW_DURATION / SAMPLING_INTERVAL)   # = 30
-LIVE_REFRESH_INTERVAL = 1.0                                        # matplotlib repaint cadence
-DATABASE_REFRESH      = 300.0                                      # seconds (5 min)
+SAMPLING_INTERVAL     = 1.0                                        
+WINDOW_DURATION       = 300                                        
+SAMPLES_PER_WINDOW    = int(WINDOW_DURATION / SAMPLING_INTERVAL)   
+LIVE_REFRESH_INTERVAL = 1.0                                        
+DATABASE_REFRESH      = 300.0                                      
 
+# Microsoft-Windows-Heap Provider GUID
+HEAP_PROVIDER_GUID = "{E61C8C90-1C48-4E58-B78A-0611367E442B}"
 
 # ---------------------------------------------------------
 # Process discovery
@@ -97,38 +97,20 @@ def get_pids_by_names(names):
     return matching_pids
 
 
-# ---------------------------------------------------------
-# Kernel metrics
-# ---------------------------------------------------------
-
 def get_max_ram(pid: int) -> int:
     """Returns total system RAM limit as a hard fallback ceiling in KB."""
-    if sys.platform != "win32":
-        try:
-            with open(f"/proc/{pid}/limits", "r") as f:
-                for line in f:
-                    if line.startswith("Max resident set"):
-                        parts = line.split()
-                        soft  = parts[3]
-                        if soft != "unlimited":
-                            return int(soft) // 1024   # bytes -> KB
-                        break
-        except (FileNotFoundError, PermissionError, ValueError, IndexError):
-            pass
-
     return psutil.virtual_memory().total // 1024
 
 
 # ---------------------------------------------------------
-# Custom Dynamic Tiered Partitioning Strategy
+# Dynamic Tiered Partitioning Strategy
 # ---------------------------------------------------------
 
 def partition_to_continious_rv_custom_dynamic(
-    pid: int, current_rss_kb: float, max_system_ram_kb: float
+    pid: int, current_val_kb: float, max_system_ram_kb: float
 ):
-    """Applies custom tier logic against a dynamic process-scoped upper limit."""
     dynamic_upper_kb = min(
-        max_system_ram_kb, max(128 * 1024, current_rss_kb * 1.5)
+        max_system_ram_kb, max(128 * 1024, current_val_kb * 1.5)
     )
 
     dynamic_upper_mb = dynamic_upper_kb / 1024
@@ -141,16 +123,7 @@ def partition_to_continious_rv_custom_dynamic(
     elif dynamic_upper_gb < 1.0:
         num_bins = 100
     else:
-        if dynamic_upper_gb <= 4:
-            num_bins = 8
-        elif dynamic_upper_gb <= 8:
-            num_bins = 8
-        elif dynamic_upper_gb <= 16:
-            num_bins = 8
-        elif dynamic_upper_gb <= 32:
-            num_bins = 8
-        else:
-            num_bins = 16
+        num_bins = 16 if dynamic_upper_gb > 32 else 8
 
     lower_kb = 0.0
     step     = (dynamic_upper_kb - lower_kb) / num_bins
@@ -163,16 +136,22 @@ def partition_to_continious_rv_custom_dynamic(
 
 
 class ProcessHistogram:
+    """
+    Maintains dual statistical distribution mappings:
+    - mallocStatsDist: pid -> statistical distribution of RAM allocated
+    - freeStatsDist:   pid -> statistical distribution of RAM deallocated
+    """
 
     def __init__(self, pid: int, max_system_ram_kb: float):
         self.pid               = pid
         self.max_system_ram_kb = max_system_ram_kb
-        self.samples           = []
+        self.samples           = {"malloc": [], "free": []}
         self.sample_count      = 0
-        self.last_distribution = None
+        self.last_distribution = {"malloc": None, "free": None}
 
-    def record(self, rss_kb: float):
-        self.samples.append(rss_kb)
+    def record(self, event_type: str, size_kb: float):
+        if event_type in self.samples:
+            self.samples[event_type].append(size_kb)
 
     def increment_sample(self):
         self.sample_count += 1
@@ -180,17 +159,18 @@ class ProcessHistogram:
     def is_window_complete(self) -> bool:
         return self.sample_count >= SAMPLES_PER_WINDOW
 
-    def get_distribution(self):
-        if not self.samples:
+    def _build_dist(self, key: str):
+        data = self.samples[key]
+        if not data:
             return None
 
-        peak_rss = max(self.samples)
+        peak_val = max(data)
         bins, num_bins = partition_to_continious_rv_custom_dynamic(
-            self.pid, peak_rss, self.max_system_ram_kb
+            self.pid, peak_val, self.max_system_ram_kb
         )
 
         frequencies = [0] * num_bins
-        for val in self.samples:
+        for val in data:
             placed = False
             for i, crv in enumerate(bins):
                 if crv.getLower() <= val < crv.getUpper():
@@ -200,65 +180,79 @@ class ProcessHistogram:
             if not placed:
                 frequencies[-1] += 1
 
-        dist = ContiniousDistribution(
-            f"Dynamic Tiered RAM Histogram PID {self.pid}",
+        return ContiniousDistribution(
+            f"Heap {key.capitalize()} Distribution PID {self.pid}",
             bins,
             frequencies,
         )
-        self.last_distribution = dist
-        return dist
+
+    def get_distributions(self):
+        dist_malloc = self._build_dist("malloc")
+        dist_free   = self._build_dist("free")
+        
+        self.last_distribution = {"malloc": dist_malloc, "free": dist_free}
+        return self.last_distribution
 
     def reset_counts(self):
-        self.samples      = []
+        self.samples      = {"malloc": [], "free": []}
         self.sample_count = 0
 
 
 # ---------------------------------------------------------
-# RAM Graph Data Container
+# Heap Graph Data Container
 # ---------------------------------------------------------
 
 class ProcessRAM_Graph:
+    """
+    Stores timeseries streams:
+    - mallocSize: PID -> malloc size allocation vs time
+    - freeSize:   PID -> free size deallocation vs time
+    """
+
+    KB_TO_GB = 1024.0 * 1024.0
 
     def __init__(self, pid: int, name: str):
         self.pid         = pid
         self.proc_name   = name
         self.time_points = []
-        self.ri_points   = []
+        
+        self.mallocSize  = []  # size allocated in GB over time
+        self.freeSize    = []  # size deallocated in GB over time
 
-    def add_point(self, time_ns: int, ri: float):
+    def add_malloc_event(self, time_ns: int, size_kb: float):
         self.time_points.append(float(time_ns))
-        self.ri_points.append(ri)
+        self.mallocSize.append(size_kb / self.KB_TO_GB)
+        self.freeSize.append(0.0)
+
+    def add_free_event(self, time_ns: int, freed_kb: float):
+        self.time_points.append(float(time_ns))
+        self.mallocSize.append(0.0)
+        self.freeSize.append(freed_kb / self.KB_TO_GB)
 
     def has_data(self) -> bool:
         return len(self.time_points) > 0
 
-    def compute_velocity(self) -> float:
-        if len(self.ri_points) < 2:
-            return 0.0
+    @staticmethod
+    def compute_kinematics(series, time_points):
+        """Computes velocity (GB/s) and acceleration (GB/s²) for a data series."""
+        if len(series) < 2:
+            return [0.0] * len(series), [0.0] * len(series)
 
-        deltas = []
-        for i in range(1, len(self.ri_points)):
-            dt = self.time_points[i] - self.time_points[i - 1]
-            if dt > 0:
-                deltas.append((self.ri_points[i] - self.ri_points[i - 1]) / dt)
+        vels = [0.0]
+        for j in range(1, len(series)):
+            dt = (time_points[j] - time_points[j - 1]) / 1e9
+            vels.append((series[j] - series[j - 1]) / dt if dt > 0 else 0.0)
 
-        return sum(deltas) / len(deltas) if deltas else 0.0
+        accs = [0.0]
+        for j in range(1, len(vels)):
+            dt = (time_points[j] - time_points[j - 1]) / 1e9
+            accs.append((vels[j] - vels[j - 1]) / dt if dt > 0 else 0.0)
 
-    def compute_acceleration(self, previous_velocity: float, previous_time_ns: float) -> float:
-        current_velocity = self.compute_velocity()
-        if previous_time_ns <= 0:
-            return 0.0
-
-        current_time_ns = self.time_points[-1] if self.time_points else 0.0
-        dt = current_time_ns - previous_time_ns
-        if dt <= 0:
-            return 0.0
-
-        return (current_velocity - previous_velocity) / dt
+        return vels, accs
 
 
 # ---------------------------------------------------------
-# Database Integration Layer
+# Database Integration Layer (UNTOUCHED GRAPHING METHODS)
 # ---------------------------------------------------------
 
 class DATABASE_INTEGRATION:
@@ -285,43 +279,8 @@ class DATABASE_INTEGRATION:
             existing = self.db.get_process(pid=pid)
             if existing is None:
                 self.db.insert_process(pid=pid, burst_time=burst_time, status="running")
-                log.debug("DB: inserted process PID %d", pid)
         except Error as e:
             log.error("DB ensure_process_exists(%d): %s", pid, e)
-
-    def update_process(
-        self,
-        pid: int,
-        burst_time: float,
-        waiting_time: float,
-        completion_time: float,
-        turnaround_time: float,
-        status: str,
-    ):
-        if not self.available:
-            return
-        try:
-            existing = self.db.get_process(pid=pid)
-            if existing is None:
-                self.db.insert_process(
-                    pid=pid,
-                    burst_time=burst_time,
-                    waiting_time=waiting_time,
-                    completion_time=completion_time,
-                    turnaround_time=turnaround_time,
-                    status=status,
-                )
-            else:
-                self.db.update_process_scheduling(
-                    pid=pid,
-                    burst_time=burst_time,
-                    waiting_time=waiting_time,
-                    completion_time=completion_time,
-                    turnaround_time=turnaround_time,
-                )
-                self.db.update_process_status(pid=pid, status=status)
-        except Error as e:
-            log.error("DB update_process(%d): %s", pid, e)
 
     def add_process_statistics(
         self,
@@ -331,8 +290,6 @@ class DATABASE_INTEGRATION:
         variance: float,
         standard_deviation: float,
         mode: float,
-        velocity: float,
-        acceleration: float,
     ):
         if not self.available:
             return
@@ -344,12 +301,6 @@ class DATABASE_INTEGRATION:
                 variance=variance,
                 standard_deviation=standard_deviation,
                 mode_ram=mode,
-                velocity_ram=velocity,
-                acceleration_ram=acceleration,
-            )
-            log.debug(
-                "DB snapshot PID %d  mean=%.6f GB  vel=%.6e  acc=%.6e",
-                pid, mean, velocity, acceleration,
             )
         except Error as e:
             log.error("DB add_process_statistics(%d): %s", pid, e)
@@ -363,21 +314,7 @@ class DATABASE_INTEGRATION:
             log.error("DB get_process_stats(%d): %s", pid, e)
             return []
 
-    def get_latest_stats_all(self):
-        if not self.available:
-            return []
-        try:
-            return self.db.get_latest_stats()
-        except Error as e:
-            log.error("DB get_latest_stats: %s", e)
-            return []
-
     def _apply_dynamic_time_axis(self, fig, ax, times):
-        """
-        Configures dynamic date/time formatting with a focused trading-style view.
-        Defaults to zooming into the most recent activity window while allowing 
-        full interactive pan/zoom out to broader historical ranges.
-        """
         clean_times = []
         for t in times:
             if isinstance(t, str):
@@ -391,7 +328,7 @@ class DATABASE_INTEGRATION:
         if not clean_times:
             return clean_times
 
-        locator = mdates.AutoDateLocator(minticks=4, maxticks=10)
+        locator   = mdates.AutoDateLocator(minticks=4, maxticks=10)
         formatter = mdates.ConciseDateFormatter(locator)
 
         ax.xaxis.set_major_locator(locator)
@@ -405,8 +342,8 @@ class DATABASE_INTEGRATION:
             )
         else:
             earliest_time = min(clean_times)
-            window_start = max(earliest_time, latest_time - timedelta(minutes=30))
-            padding = timedelta(seconds=15)
+            window_start  = max(earliest_time, latest_time - timedelta(minutes=30))
+            padding       = timedelta(seconds=15)
             ax.set_xlim(window_start, latest_time + padding)
 
         fig.autofmt_xdate()
@@ -427,31 +364,9 @@ class DATABASE_INTEGRATION:
         clean_times = self._apply_dynamic_time_axis(fig, ax, raw_times)
 
         ax.plot(clean_times, vels, color="darkorange", linewidth=1.8, marker="o", markersize=4)
-        ax.set_title(f"PID {pid} — RAM Velocity over time (DB history)")
+        ax.set_title(f"PID {pid} — Heap Velocity over time (DB history)")
         ax.set_xlabel("Snapshot time")
-        ax.set_ylabel("VelocityRAM  (ri / ns)")
-        ax.grid(True)
-        fig.tight_layout()
-        self._render_interactive(fig)
-
-    def live_plot_ram_acceleration(self, pid: int):
-        rows = self.get_statistical_behavior_of_process(pid)
-        if not rows:
-            print(f"[DB Plot] No stats data for PID {pid}")
-            return
-
-        import matplotlib.pyplot as plt
-
-        raw_times = [r["timeSnapshot"] for r in rows]
-        accs      = [float(r["AcclerationRAM"] or 0) for r in rows]
-
-        fig, ax = plt.subplots(figsize=(10, 4))
-        clean_times = self._apply_dynamic_time_axis(fig, ax, raw_times)
-
-        ax.plot(clean_times, accs, color="crimson", linewidth=1.8, marker="s", markersize=4)
-        ax.set_title(f"PID {pid} — RAM Acceleration over time (DB history)")
-        ax.set_xlabel("Snapshot time")
-        ax.set_ylabel("AccelerationRAM  (ri / ns²)")
+        ax.set_ylabel("Velocity  (GB / ns)")
         ax.grid(True)
         fig.tight_layout()
         self._render_interactive(fig)
@@ -471,7 +386,7 @@ class DATABASE_INTEGRATION:
         clean_times = self._apply_dynamic_time_axis(fig, ax, raw_times)
 
         ax.plot(clean_times, vars_, color="purple", linewidth=1.8, marker="^", markersize=4)
-        ax.set_title(f"PID {pid} — RAM Variance over time (DB history)")
+        ax.set_title(f"PID {pid} — Heap Variance over time (DB history)")
         ax.set_xlabel("Snapshot time")
         ax.set_ylabel("Variance  (GB²)")
         ax.grid(True)
@@ -493,9 +408,9 @@ class DATABASE_INTEGRATION:
         clean_times = self._apply_dynamic_time_axis(fig, ax, raw_times)
 
         ax.plot(clean_times, means, color="steelblue", linewidth=1.8, marker="D", markersize=4)
-        ax.set_title(f"PID {pid} — Mean RAM over time (DB history)")
+        ax.set_title(f"PID {pid} — Mean Heap over time (DB history)")
         ax.set_xlabel("Snapshot time")
-        ax.set_ylabel("Mean RAM  (GB)")
+        ax.set_ylabel("Mean Heap  (GB)")
         ax.grid(True)
         fig.tight_layout()
         self._render_interactive(fig)
@@ -560,32 +475,10 @@ def read_process(pid: int, current_time: int):
         cpu_times = proc.cpu_times()
         cpu_ticks = int((cpu_times.user + cpu_times.system) * 100)
 
-        threads = proc.num_threads()
-
-        try:
-            fd_count = (
-                proc.num_handles()
-                if sys.platform == "win32"
-                else len(proc.open_files())
-            )
-        except (psutil.AccessDenied, AttributeError):
-            fd_count = 0
-
-        try:
-            io       = proc.io_counters()
-            read_kb  = io.read_bytes  // 1024
-            write_kb = io.write_bytes // 1024
-        except (psutil.AccessDenied, AttributeError):
-            read_kb = write_kb = 0
-
         return {
             "pid":          pid,
             "name":         proc.name(),
             "rss_kb":       rss_kb,
-            "threads":      threads,
-            "fd_count":     fd_count,
-            "io_read_kb":   read_kb,
-            "io_write_kb":  write_kb,
             "cpu_ticks":    cpu_ticks,
             "timestamp_ns": current_time,
         }
@@ -611,10 +504,6 @@ class ProcessFilter:
             if self.names:
                 self.target_pids.update(get_pids_by_names(self.names))
 
-        log.info(
-            f"Target PIDs: {sorted(self.target_pids) if self.target_pids else 'None'}"
-        )
-
     def get_target_pids(self):
         return self.target_pids
 
@@ -628,54 +517,12 @@ class Commands:
     def __init__(self):
         self.active_watch_mode = None
 
-        self.commFlags = {
-            "--l":       self.showListPids,
-            "--lr":      self.show_pids_ram,
-            "--lrmb":    self.show_pids_ram_MB,
-            "--lrgb":    self.show_pids_ram_GB,
-            "--io":      self.show_pids_io,
-            "--iomb":    self.show_pids_io_MB,
-            "--iogb":    self.show_pids_io_GB,
-            "--read":    self.show_pids_read,
-            "--readmb":  self.show_pids_read_MB,
-            "--readgb":  self.show_pids_read_GB,
-            "--write":   self.show_pids_write,
-            "--writemb": self.show_pids_write_MB,
-            "--writegb": self.show_pids_write_GB,
-            "--lt":      self.show_pids_threads,
-            "--lfd":     self.show_pids_fd,
-        }
-
-        self.commRootList = {
-            "pids":            self.show_pids,
-            "curr --tick":     self.show_curr_tick,
-            "curr --tns":      self.show_curr_tns,
-            "monitor --stop":  self.stop_monitor,
-            "watch --stop":    self.stop_watch_mode,
-        }
-
     def execute(self, cmd_str: str, latest_snapshots: dict, monitor=None):
         cmd = cmd_str.strip()
         if not cmd:
             return
 
         tokens = cmd.split()
-
-        if cmd == "monitor --stop":
-            self.stop_monitor(monitor)
-            return
-
-        if cmd == "watch --stop":
-            self.stop_watch_mode(None)
-            return
-
-        if "--watch" in cmd:
-            self.active_watch_mode = cmd.replace("--watch", "").strip()
-            print(
-                f"Watch mode enabled for: '{self.active_watch_mode}'. "
-                "Type 'watch --stop' to end."
-            )
-            return
 
         if cmd.startswith("monitor --live figshow"):
             sub_tokens  = tokens[3:]
@@ -687,171 +534,14 @@ class Commands:
                 pid = int(sub_tokens[0])
                 if pid in latest_snapshots:
                     target_pids = [pid]
-                else:
-                    print(f"PID {pid} is not currently monitored.")
-                    return
-            else:
-                target_name = sub_tokens[0].lower()
-                target_pids = [
-                    p
-                    for p, snap in latest_snapshots.items()
-                    if snap["name"].lower() == target_name
-                ]
-                if not target_pids:
-                    print(
-                        f"No monitored process found matching name '{sub_tokens[0]}'"
-                    )
-                    return
-
             monitor.show_live_figures(target_pids)
             return
 
         if cmd.startswith("db plot") and monitor is not None:
-            if len(tokens) < 4 or not tokens[3].isdigit():
-                print("Usage: db plot --vel|--acc|--var|--mean <pid>")
-                return
-
-            flag = tokens[2]
-            pid_arg = int(tokens[3])
-
-            if flag not in {"--vel", "--acc", "--var", "--mean"}:
-                print(f"Unknown db plot flag: {flag}")
-                return
-
-            monitor.queue_db_plot_request(flag, pid_arg)
-            print(f"Queued DB plot request: {flag} PID {pid_arg}")
-            return
-
-        if tokens[0] == "pids" and len(tokens) > 1 and tokens[1].isdigit():
-            target_pid = int(tokens[1])
-            if target_pid not in latest_snapshots:
-                print(f"PID {target_pid} not found in monitored snapshots.")
-                return
-
-            snapshot = latest_snapshots[target_pid]
-            if len(tokens) == 2:
-                self.show_pids(snapshot)
-            else:
-                flag = tokens[2]
-                if flag in self.commFlags:
-                    func = self.commFlags[flag]
-                    func(snapshot.get("pid") if flag == "--l" else snapshot)
-                else:
-                    print(f"Unknown flag: {flag}")
-            return
-
-        if cmd in self.commRootList:
-            func = self.commRootList[cmd]
-            for snapshot in latest_snapshots.values():
-                func(snapshot)
-            return
-
-        flag = cmd.replace("pids ", "").strip()
-        if flag in self.commFlags:
-            func = self.commFlags[flag]
-            for snapshot in latest_snapshots.values():
-                func(
-                    snapshot.get("pid") if flag == "--l" else snapshot
-                )
-            return
-
-        print(f"Unknown command: {cmd_str}")
-
-    def render_watch_frame(self, latest_snapshots: dict, monitor):
-        if not self.active_watch_mode:
-            return
-        os.system("cls" if sys.platform == "win32" else "clear")
-        print(f"=== LIVE CLI MONITORING MODE [{self.active_watch_mode}] ===")
-        print("Type 'watch --stop' and hit Enter to exit watch mode.\n")
-        self.execute(self.active_watch_mode, latest_snapshots, monitor)
-
-    def stop_watch_mode(self, snapshot=None):
-        self.active_watch_mode = None
-        print("\nWatch mode stopped.")
-
-    def show_pids(self, snapshot: dict):
-        retText = ""
-        for key, val in snapshot.items():
-            retText += f"{key}: {val}\n"
-        print(retText)
-
-    def showListPids(self, pid: int):
-        print(pid)
-
-    def show_pids_ram(self, snapshot: dict):
-        print(
-            f"PID: {snapshot['pid']:<7} | Name: {snapshot['name']:<25} | "
-            f"RAM: {snapshot['rss_kb']} KB"
-        )
-
-    def show_pids_ram_MB(self, snapshot: dict):
-        print(
-            f"PID: {snapshot['pid']:<7} | Name: {snapshot['name']:<25} | "
-            f"RAM: {snapshot['rss_kb'] / 1024:.2f} MB"
-        )
-
-    def show_pids_ram_GB(self, snapshot: dict):
-        print(
-            f"PID: {snapshot['pid']:<7} | Name: {snapshot['name']:<25} | "
-            f"RAM: {(snapshot['rss_kb'] / 1024) / 1024:.4f} GB"
-        )
-
-    def show_pids_io(self, snapshot: dict):
-        print(
-            f"{snapshot['pid']} read: {snapshot['io_read_kb']} KB, "
-            f"write: {snapshot['io_write_kb']} KB"
-        )
-
-    def show_pids_io_MB(self, snapshot: dict):
-        print(
-            f"{snapshot['pid']} read: {snapshot['io_read_kb'] / 1024:.2f} MB, "
-            f"write: {snapshot['io_write_kb'] / 1024:.2f} MB"
-        )
-
-    def show_pids_io_GB(self, snapshot: dict):
-        print(
-            f"{snapshot['pid']} read: {(snapshot['io_read_kb'] / 1024) / 1024:.4f} GB, "
-            f"write: {(snapshot['io_write_kb'] / 1024) / 1024:.4f} GB"
-        )
-
-    def show_pids_read(self, snapshot: dict):
-        print(f"{snapshot['pid']} read: {snapshot['io_read_kb']} KB")
-
-    def show_pids_read_MB(self, snapshot: dict):
-        print(f"{snapshot['pid']} read: {snapshot['io_read_kb'] / 1024:.2f} MB")
-
-    def show_pids_read_GB(self, snapshot: dict):
-        print(
-            f"{snapshot['pid']} read: {(snapshot['io_read_kb'] / 1024) / 1024:.4f} GB"
-        )
-
-    def show_pids_write(self, snapshot: dict):
-        print(f"{snapshot['pid']} write: {snapshot['io_write_kb']} KB")
-
-    def show_pids_write_MB(self, snapshot: dict):
-        print(f"{snapshot['pid']} write: {snapshot['io_write_kb'] / 1024:.2f} MB")
-
-    def show_pids_write_GB(self, snapshot: dict):
-        print(
-            f"{snapshot['pid']} write: {(snapshot['io_write_kb'] / 1024) / 1024:.4f} GB"
-        )
-
-    def show_pids_threads(self, snapshot: dict):
-        print(f"{snapshot['pid']} threads: {snapshot['threads']}")
-
-    def show_pids_fd(self, snapshot: dict):
-        print(f"{snapshot['pid']} handles/fd: {snapshot['fd_count']}")
-
-    def show_curr_tick(self, snapshot: dict):
-        print(f"{snapshot['pid']} cpu ticks: {snapshot['cpu_ticks']}")
-
-    def show_curr_tns(self, snapshot: dict):
-        print(f"{snapshot['pid']} timestamp ns: {snapshot['timestamp_ns']}")
-
-    def stop_monitor(self, monitor):
-        if monitor:
-            monitor.stop()
-            log.info("Monitor stopped via command")
+            if len(tokens) >= 4 and tokens[3].isdigit():
+                flag    = tokens[2]
+                pid_arg = int(tokens[3])
+                monitor.queue_db_plot_request(flag, pid_arg)
 
 
 # ---------------------------------------------------------
@@ -878,8 +568,6 @@ class Monitor:
         self.input_handler = AsyncConsoleInput()
 
         self.target_pids = filt.get_target_pids()
-        if not self.target_pids:
-            log.warning("No target processes found")
 
         self.fsm_state  = {}
         self.ram_max    = {}
@@ -893,20 +581,55 @@ class Monitor:
         self.active_db_fig    = None
 
         self.db_plot_requests = queue.Queue()
+        self.db_integration   = DATABASE_INTEGRATION(time_period_save_to_memory=DATABASE_REFRESH)
+        self.last_db_flush_time = {}
 
-        self.db_integration = DATABASE_INTEGRATION(
-            time_period_save_to_memory=DATABASE_REFRESH
+        # Initialize Windows ETW Session for Microsoft-Windows-Heap Provider
+        # NEW (Valid ETWTask object)
+        job = etw.ETWTask(
+            providers=[HEAP_PROVIDER_GUID],
+            event_callback=self._handle_etw_event
         )
+        self.etw_session = job
+        self.etw_thread = threading.Thread(target=self.etw_session.start, daemon=True)
+        self.etw_thread.start()
 
-        self.last_db_flush_time    = {}
-        self.last_velocity         = {}
-        self.last_velocity_time_ns = {}
+    def _handle_etw_event(self, event):
+        try:
+            header = event[0]
+            data   = event[1]
+            pid    = header.get("ProcessId", 0)
+
+            if pid not in self.target_pids:
+                return
+
+            now_ns = time.time_ns()
+            if pid not in self.RAM_graph:
+                self._init_pid(pid, get_process_name(pid) or "Process")
+
+            graph = self.RAM_graph[pid]
+            hist  = self.histograms[pid]
+
+            event_id = header.get("EventId", 0)
+            
+            # EventId 1 / 33: Heap Allocation (malloc)
+            if event_id in (1, 33):
+                alloc_bytes = data.get("AllocSize", 0)
+                size_kb = alloc_bytes / 1024.0
+                graph.add_malloc_event(now_ns, size_kb)
+                hist.record("malloc", size_kb)
+
+            # EventId 2 / 34: Heap Free (free)
+            elif event_id in (2, 34):
+                free_bytes = data.get("FreeSize", 0)
+                freed_kb = free_bytes / 1024.0
+                graph.add_free_event(now_ns, freed_kb)
+                hist.record("free", freed_kb)
+
+        except Exception as e:
+            log.error("Error processing ETW event: %s", e)
 
     def _on_close(self, event):
-        """
-        Explicitly triggered when user clicks 'X' on any plot figure.
-        Resets figure pointers, closes all backend windows, and forces GC.
-        """
         self.live_plot_active = False
         self.fig = None
         self.axes = None
@@ -915,7 +638,6 @@ class Monitor:
         import matplotlib.pyplot as plt
         plt.close("all")
         gc.collect()
-        log.info("Plot window closed via 'X'; resources explicitly released.")
 
     def _init_pid(self, pid: int, name: str) -> bool:
         ram_max_kb = get_max_ram(pid)
@@ -925,70 +647,52 @@ class Monitor:
         self.RAM_graph[pid]  = ProcessRAM_Graph(pid, name)
         self.fsm_state[pid]  = STATE_HISTOGRAM
 
-        self.last_db_flush_time[pid]    = time.time()
-        self.last_velocity[pid]         = 0.0
-        self.last_velocity_time_ns[pid] = 0.0
-
+        self.last_db_flush_time[pid] = time.time()
         self.db_integration.ensure_process_exists(pid, burst_time=0.0)
-
-        log.info(
-            "Monitoring PID %d (%s) with Dynamic Tiered Range Binning", pid, name
-        )
         return True
 
     def _finalize_window(self, pid: int):
         hist = self.histograms[pid]
-        dist = hist.get_distribution()
+        dists = hist.get_distributions()
 
-        if dist is None:
+        if dists["malloc"] is None and dists["free"] is None:
             hist.reset_counts()
             self.fsm_state[pid] = STATE_HISTOGRAM
             return
-
-        mode_kb    = dist.getMode()
-        ram_max_kb = self.ram_max[pid]
-        ri         = mode_kb / ram_max_kb
-        ts         = time.time_ns()
-
-        self.RAM_graph[pid].add_point(ts, ri)
-        hist.reset_counts()
 
         elapsed_since_flush = time.time() - self.last_db_flush_time.get(pid, 0.0)
         if elapsed_since_flush >= DATABASE_REFRESH:
             self.fsm_state[pid] = STATE_UPDATE_DATABASE
         else:
+            hist.reset_counts()
             self.fsm_state[pid] = STATE_HISTOGRAM
 
     def _save_to_database(self, pid: int):
         hist  = self.histograms.get(pid)
         graph = self.RAM_graph.get(pid)
 
-        if hist is None or hist.last_distribution is None or graph is None or not graph.has_data():
+        if hist is None or hist.last_distribution["malloc"] is None:
+            hist.reset_counts()
             self.last_db_flush_time[pid] = time.time()
             self.fsm_state[pid]          = STATE_HISTOGRAM
             return
 
-        dist = hist.last_distribution
+        dist = hist.last_distribution["malloc"]
 
-        # Raw statistics from ContiniousDistribution are in KB
+        # Raw statistical properties from distribution in KB
         mean_kb     = dist.getMean()
         variance_kb = dist.getVariance()
         std_dev_kb  = dist.getStandardDeviation()
         mode_kb     = dist.getMode()
 
-        # Convert KB -> GB before saving into MySQL database
+        # Convert properties to GB
         KB_TO_GB    = 1024.0 * 1024.0
-        mean_gb     = mean_kb / KB_TO_GB
+        mean_gb     = mean_kb  / KB_TO_GB
         variance_gb = variance_kb / (KB_TO_GB ** 2)
         std_dev_gb  = std_dev_kb / KB_TO_GB
-        mode_gb     = mode_kb / KB_TO_GB
+        mode_gb     = mode_kb  / KB_TO_GB
 
-        velocity     = graph.compute_velocity()
-        acceleration = graph.compute_acceleration(
-            previous_velocity = self.last_velocity.get(pid, 0.0),
-            previous_time_ns  = self.last_velocity_time_ns.get(pid, 0.0),
-        )
-
+        # Full datetime snapshot: Year, Month, Day, Hour, Minute, Second
         snapshot_time = datetime.now()
 
         self.db_integration.add_process_statistics(
@@ -998,42 +702,35 @@ class Monitor:
             variance           = variance_gb,
             standard_deviation = std_dev_gb,
             mode               = mode_gb,
-            velocity           = velocity,
-            acceleration       = acceleration,
         )
 
-        current_time_ns = graph.time_points[-1] if graph.time_points else 0.0
-        self.last_velocity[pid]         = velocity
-        self.last_velocity_time_ns[pid] = current_time_ns
-        self.last_db_flush_time[pid]    = time.time()
+        hist.reset_counts()
 
-        log.info(
-            "DB flush PID %d  mean=%.6f GB  var=%.6e GB²  vel=%.4e  acc=%.4e",
-            pid, mean_gb, variance_gb, velocity, acceleration,
-        )
-
+        self.last_db_flush_time[pid] = time.time()
         self.fsm_state[pid] = STATE_HISTOGRAM
 
     def show_live_figures(self, target_pids: list):
         import matplotlib.pyplot as plt
 
         self._on_close(None)
-
         plt.ion()
         self.live_target_pids = target_pids
 
-        num_plots = min(len(target_pids), 3)
-        if num_plots == 0:
-            print("No processes to plot.")
+        num_pids = min(len(target_pids), 3)
+        if num_pids == 0:
             return
 
-        self.fig, self.axes = plt.subplots(num_plots, 1, figsize=(10, 8))
-        if num_plots == 1:
+        # 6 Subplots per PID: (Alloc Size, Alloc Vel, Alloc Acc) & (Free Size, Free Vel, Free Acc)
+        num_rows = num_pids * 6
+        self.fig, self.axes = plt.subplots(num_rows, 1, figsize=(11, 3 * num_rows))
+        
+        if num_rows == 1:
             self.axes = [self.axes]
+        else:
+            self.axes = list(self.axes)
 
         self.fig.canvas.mpl_connect("close_event", self._on_close)
         self.live_plot_active = True
-        print(f"Live GUI Plotting enabled for PIDs: {target_pids}")
 
     def _update_live_plot_frame(self, force_redraw: bool = False):
         if not self.live_plot_active or self.fig is None:
@@ -1050,34 +747,64 @@ class Monitor:
                 pids = self.live_target_pids[:3]
 
                 for i, pid in enumerate(pids):
-                    ax = self.axes[i]
-                    ax.clear()
+                    ax_m_size = self.axes[i * 6]
+                    ax_m_vel  = self.axes[i * 6 + 1]
+                    ax_m_acc  = self.axes[i * 6 + 2]
+                    ax_f_size = self.axes[i * 6 + 3]
+                    ax_f_vel  = self.axes[i * 6 + 4]
+                    ax_f_acc  = self.axes[i * 6 + 5]
+
+                    for ax in (ax_m_size, ax_m_vel, ax_m_acc, ax_f_size, ax_f_vel, ax_f_acc):
+                        ax.clear()
 
                     graph = self.RAM_graph.get(pid)
                     if graph and graph.has_data():
-                        times = list(graph.time_points)
-                        ris   = list(graph.ri_points)
-                        ax.plot(
-                            times,
-                            ris,
-                            color="royalblue",
-                            linewidth=1.8,
-                            marker="o",
-                            markersize=4,
-                        )
-                        ax.set_title(f"{graph.proc_name} (PID {pid}) — ri vs time_ns")
-                    else:
-                        name = get_process_name(pid) or "Process"
-                        ax.set_title(f"{name} (PID {pid}) — waiting for first 30 s window…")
+                        t0    = graph.time_points[0]
+                        times = [(t - t0) / 1e9 for t in graph.time_points]
 
-                    ax.set_xlabel("time (ns)")
-                    ax.set_ylabel("ri = mode_kb / RAM_max")
-                    ax.set_ylim(0, 1)
-                    ax.grid(True)
+                        # Kinematics calculations
+                        m_vels, m_accs = ProcessRAM_Graph.compute_kinematics(graph.mallocSize, graph.time_points)
+                        f_vels, f_accs = ProcessRAM_Graph.compute_kinematics(graph.freeSize, graph.time_points)
 
+                        label = f"{graph.proc_name} (PID {pid})"
+
+                        # --- ALLOCATIONS (mallocSize) ---
+                        ax_m_size.plot(times, graph.mallocSize, color="royalblue", linewidth=1.5, marker="o", markersize=3)
+                        ax_m_size.set_title(f"{label} — Malloc Allocation Size")
+                        ax_m_size.set_ylabel("Allocated (GB)")
+                        ax_m_size.grid(True)
+
+                        ax_m_vel.plot(times, m_vels, color="darkorange", linewidth=1.5, marker="o", markersize=3)
+                        ax_m_vel.set_title(f"{label} — Malloc Allocation Velocity")
+                        ax_m_vel.set_ylabel("Velocity (GB/s)")
+                        ax_m_vel.grid(True)
+
+                        ax_m_acc.plot(times, m_accs, color="crimson", linewidth=1.5, marker="o", markersize=3)
+                        ax_m_acc.set_title(f"{label} — Malloc Allocation Acceleration")
+                        ax_m_acc.set_ylabel("Accel (GB/s²)")
+                        ax_m_acc.grid(True)
+
+                        # --- DEALLOCATIONS (freeSize) ---
+                        ax_f_size.plot(times, graph.freeSize, color="teal", linewidth=1.5, marker="s", markersize=3)
+                        ax_f_size.set_title(f"{label} — Free Deallocation Size")
+                        ax_f_size.set_ylabel("Deallocated (GB)")
+                        ax_f_size.grid(True)
+
+                        ax_f_vel.plot(times, f_vels, color="darkgreen", linewidth=1.5, marker="s", markersize=3)
+                        ax_f_vel.set_title(f"{label} — Free Deallocation Velocity")
+                        ax_f_vel.set_ylabel("Velocity (GB/s)")
+                        ax_f_vel.grid(True)
+
+                        ax_f_acc.plot(times, f_accs, color="purple", linewidth=1.5, marker="s", markersize=3)
+                        ax_f_acc.set_title(f"{label} — Free Deallocation Acceleration")
+                        ax_f_acc.set_ylabel("Accel (GB/s²)")
+                        ax_f_acc.grid(True)
+
+                    ax_f_acc.set_xlabel("Time (seconds since start)")
+
+                self.fig.tight_layout()
                 self.fig.canvas.draw_idle()
 
-            # Pump OS window events to avoid "Not Responding" freeze
             self.fig.canvas.start_event_loop(0.001)
 
         except Exception as e:
@@ -1098,11 +825,7 @@ class Monitor:
 
             self._on_close(None)
 
-            if flag == "--vel":
-                self.db_integration.live_plot_ram_velocity(pid)
-            elif flag == "--acc":
-                self.db_integration.live_plot_ram_acceleration(pid)
-            elif flag == "--var":
+            if flag == "--var":
                 self.db_integration.live_plot_variance(pid)
             elif flag == "--mean":
                 self.db_integration.live_plot_mean(pid)
@@ -1128,9 +851,6 @@ class Monitor:
 
                 for pid in list(self.target_pids):
                     if not psutil.pid_exists(pid):
-                        if pid in self.previous_cpu:
-                            log.info(f"Process {pid} has terminated")
-                            del self.previous_cpu[pid]
                         continue
 
                     snapshot = read_process(pid, current_time)
@@ -1143,25 +863,8 @@ class Monitor:
                         if not self._init_pid(pid, snapshot["name"]):
                             continue
 
-                    old = self.previous_cpu.get(pid)
-                    if old:
-                        delta_cpu  = snapshot["cpu_ticks"] - old["cpu_ticks"]
-                        delta_time = snapshot["timestamp_ns"] - old["timestamp_ns"]
-                        snapshot["cpu_percent"] = (
-                            round(
-                                (delta_cpu / 100) / (delta_time / 1e9) * 100, 2
-                            )
-                            if delta_time > 0
-                            else 0
-                        )
-                    else:
-                        snapshot["cpu_percent"] = 0
-
-                    self.previous_cpu[pid] = snapshot
-                    self.data.setdefault(pid, []).append(snapshot)
-
+                    # 5-minute window processing
                     if self.fsm_state[pid] == STATE_HISTOGRAM:
-                        self.histograms[pid].record(snapshot["rss_kb"])
                         self.histograms[pid].increment_sample()
                         if self.histograms[pid].is_window_complete():
                             self.fsm_state[pid] = STATE_LIVE_PLOT
@@ -1172,14 +875,10 @@ class Monitor:
                     if self.fsm_state[pid] == STATE_UPDATE_DATABASE:
                         self._save_to_database(pid)
 
-                if self.commands.active_watch_mode:
-                    self.commands.render_watch_frame(latest_snapshots, self)
-
             cmd = self.input_handler.poll()
             if cmd:
                 self.commands.execute(cmd, latest_snapshots, self)
 
-            # Continuous OS GUI event loop pumping for both Live and DB plots
             import matplotlib.pyplot as plt
 
             if self.live_plot_active and self.fig is not None:
@@ -1203,8 +902,9 @@ class Monitor:
     def stop(self):
         self.running = False
         self._on_close(None)
+        if hasattr(self, 'etw_session'):
+            self.etw_session.stop()
         self.db_integration.close()
-        log.info("Monitor stopped; DB connection closed.")
 
 
 # ---------------------------------------------------------
@@ -1221,27 +921,10 @@ def main():
     filt    = ProcessFilter(args.pid, args.name)
     monitor = Monitor(filt)
 
-    if not monitor.target_pids:
-        log.error("No target processes found. Exiting.")
-        return
-
-    log.info(f"Monitoring started — tracking {len(monitor.target_pids)} processes")
-    log.info(
-        f"Window: {SAMPLES_PER_WINDOW} samples x {args.interval}s "
-        f"= {WINDOW_DURATION}s per scatter point"
-    )
-    log.info(
-        f"DB flush period: {DATABASE_REFRESH}s  "
-        f"({'connected' if monitor.db_integration.available else 'DISCONNECTED — stats will not be saved'})"
-    )
-
     def handle_stop(s, f):
-        log.info("Stopping monitor...")
         monitor.stop()
 
     signal.signal(signal.SIGINT, handle_stop)
-    if hasattr(signal, "SIGTERM"):
-        signal.signal(signal.SIGTERM, handle_stop)
 
     try:
         monitor.loop(args.interval)

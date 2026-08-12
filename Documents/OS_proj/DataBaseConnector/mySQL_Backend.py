@@ -228,7 +228,7 @@ class Database:
 
     def get_process_stats(self, pid: int):
         """
-        Get every RAM/statistics snapshot for a process.
+        Get every heap-size statistics snapshot for a process.
 
         Ordered chronologically.
         """
@@ -241,9 +241,7 @@ class Database:
                 s.meanRAM,
                 s.variance,
                 s.standardDeviation,
-                s.modeRAM,
-                s.VelocityRAM,
-                s.AcclerationRAM
+                s.modeRAM
             FROM ProcessTable p
             INNER JOIN ProccessStatsInfo s
                 ON p.pid = s.pid
@@ -268,9 +266,7 @@ class Database:
                 s.meanRAM,
                 s.variance,
                 s.standardDeviation,
-                s.modeRAM,
-                s.VelocityRAM,
-                s.AcclerationRAM
+                s.modeRAM
             FROM ProcessTable p
             INNER JOIN ProccessStatsInfo s
                 ON p.pid = s.pid
@@ -296,9 +292,7 @@ class Database:
                 s.meanRAM,
                 s.variance,
                 s.standardDeviation,
-                s.modeRAM,
-                s.VelocityRAM,
-                s.AcclerationRAM
+                s.modeRAM
             FROM ProcessTable p
             INNER JOIN ProccessStatsInfo s
                 ON p.pid = s.pid
@@ -315,7 +309,7 @@ class Database:
 
     def get_highest_ram_usage(self):
         """
-        Processes/statistics ordered by RAM usage.
+        Processes/statistics ordered by mean heap usage.
         """
 
         query = """
@@ -328,46 +322,6 @@ class Database:
             INNER JOIN ProccessStatsInfo s
                 ON p.pid = s.pid
             ORDER BY s.meanRAM DESC;
-        """
-
-        return self._execute_select(query)
-
-
-    def get_highest_ram_velocity(self):
-        """
-        Statistics ordered by RAM velocity.
-        """
-
-        query = """
-            SELECT
-                p.pid,
-                p.status,
-                s.timeSnapshot,
-                s.VelocityRAM
-            FROM ProcessTable p
-            INNER JOIN ProccessStatsInfo s
-                ON p.pid = s.pid
-            ORDER BY s.VelocityRAM DESC;
-        """
-
-        return self._execute_select(query)
-
-
-    def get_highest_ram_acceleration(self):
-        """
-        Statistics ordered by RAM acceleration.
-        """
-
-        query = """
-            SELECT
-                p.pid,
-                p.status,
-                s.timeSnapshot,
-                s.AcclerationRAM
-            FROM ProcessTable p
-            INNER JOIN ProccessStatsInfo s
-                ON p.pid = s.pid
-            ORDER BY s.AcclerationRAM DESC;
         """
 
         return self._execute_select(query)
@@ -724,8 +678,6 @@ class Database:
         variance: float,
         standard_deviation: float,
         mode_ram: float,
-        velocity_ram: float,
-        acceleration_ram: float
     ):
 
         query = """
@@ -736,11 +688,9 @@ class Database:
                 meanRAM,
                 variance,
                 standardDeviation,
-                modeRAM,
-                VelocityRAM,
-                AcclerationRAM
+                modeRAM
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
+            VALUES (%s, %s, %s, %s, %s, %s);
         """
 
         return self._execute_insert(
@@ -752,8 +702,6 @@ class Database:
                 variance,
                 standard_deviation,
                 mode_ram,
-                velocity_ram,
-                acceleration_ram
             )
         )
 
@@ -1009,9 +957,7 @@ class Database:
                 s.meanRAM,
                 s.variance,
                 s.standardDeviation,
-                s.modeRAM,
-                s.VelocityRAM,
-                s.AcclerationRAM
+                s.modeRAM
 
             FROM ProcessTable p
 
@@ -1024,13 +970,13 @@ class Database:
         """
 
         return self._execute_select(query)
-    
-    
-    
+
+
+
 def test():
     print("attempting to connect to database")
     base = Database()
     base.close()
-    print("closed with  no errors")
-    
+    print("closed with no errors")
+
 test()
