@@ -241,9 +241,7 @@ class Database:
                 s.meanRAM,
                 s.variance,
                 s.standardDeviation,
-                s.modeRAM,
-                s.VelocityRAM,
-                s.AcclerationRAM
+                s.modeRAM
             FROM ProcessTable p
             INNER JOIN ProccessStatsInfo s
                 ON p.pid = s.pid
@@ -268,9 +266,7 @@ class Database:
                 s.meanRAM,
                 s.variance,
                 s.standardDeviation,
-                s.modeRAM,
-                s.VelocityRAM,
-                s.AcclerationRAM
+                s.modeRAM
             FROM ProcessTable p
             INNER JOIN ProccessStatsInfo s
                 ON p.pid = s.pid
@@ -296,9 +292,7 @@ class Database:
                 s.meanRAM,
                 s.variance,
                 s.standardDeviation,
-                s.modeRAM,
-                s.VelocityRAM,
-                s.AcclerationRAM
+                s.modeRAM
             FROM ProcessTable p
             INNER JOIN ProccessStatsInfo s
                 ON p.pid = s.pid
@@ -328,46 +322,6 @@ class Database:
             INNER JOIN ProccessStatsInfo s
                 ON p.pid = s.pid
             ORDER BY s.meanRAM DESC;
-        """
-
-        return self._execute_select(query)
-
-
-    def get_highest_ram_velocity(self):
-        """
-        Statistics ordered by RAM velocity.
-        """
-
-        query = """
-            SELECT
-                p.pid,
-                p.status,
-                s.timeSnapshot,
-                s.VelocityRAM
-            FROM ProcessTable p
-            INNER JOIN ProccessStatsInfo s
-                ON p.pid = s.pid
-            ORDER BY s.VelocityRAM DESC;
-        """
-
-        return self._execute_select(query)
-
-
-    def get_highest_ram_acceleration(self):
-        """
-        Statistics ordered by RAM acceleration.
-        """
-
-        query = """
-            SELECT
-                p.pid,
-                p.status,
-                s.timeSnapshot,
-                s.AcclerationRAM
-            FROM ProcessTable p
-            INNER JOIN ProccessStatsInfo s
-                ON p.pid = s.pid
-            ORDER BY s.AcclerationRAM DESC;
         """
 
         return self._execute_select(query)
@@ -723,9 +677,7 @@ class Database:
         mean_ram: float,
         variance: float,
         standard_deviation: float,
-        mode_ram: float,
-        velocity_ram: float,
-        acceleration_ram: float
+        mode_ram: float
     ):
 
         query = """
@@ -736,11 +688,9 @@ class Database:
                 meanRAM,
                 variance,
                 standardDeviation,
-                modeRAM,
-                VelocityRAM,
-                AcclerationRAM
+                modeRAM
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
+            VALUES (%s, %s, %s, %s, %s, %s);
         """
 
         return self._execute_insert(
@@ -751,9 +701,7 @@ class Database:
                 mean_ram,
                 variance,
                 standard_deviation,
-                mode_ram,
-                velocity_ram,
-                acceleration_ram
+                mode_ram
             )
         )
 
@@ -788,12 +736,6 @@ class Database:
         virus_id: int,
         date_discovered: datetime
     ):
-        """
-        Create an infection relationship.
-
-        Both pid and virus_id MUST already exist.
-        MySQL foreign keys enforce this.
-        """
 
         query = """
             INSERT INTO InfectedProcesses
@@ -821,9 +763,6 @@ class Database:
         child_pid: int,
         creation_date: datetime
     ):
-        """
-        Both processes must already exist.
-        """
 
         query = """
             INSERT INTO ParentChildTable
@@ -1009,9 +948,7 @@ class Database:
                 s.meanRAM,
                 s.variance,
                 s.standardDeviation,
-                s.modeRAM,
-                s.VelocityRAM,
-                s.AcclerationRAM
+                s.modeRAM
 
             FROM ProcessTable p
 
@@ -1024,13 +961,3 @@ class Database:
         """
 
         return self._execute_select(query)
-    
-    
-    
-def test():
-    print("attempting to connect to database")
-    base = Database()
-    base.close()
-    print("closed with  no errors")
-    
-test()

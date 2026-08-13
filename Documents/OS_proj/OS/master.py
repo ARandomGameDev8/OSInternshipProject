@@ -55,8 +55,8 @@ except (AttributeError, ValueError):
 # ---------------------------------------------------------
 
 SAMPLING_INTERVAL     = 1.0                                        # seconds between RSS reads
-WINDOW_DURATION       = 30                                         # seconds per histogram window
-SAMPLES_PER_WINDOW    = int(WINDOW_DURATION / SAMPLING_INTERVAL)   # = 30
+WINDOW_DURATION       = 300                                        # seconds per histogram window (5 mins)
+SAMPLES_PER_WINDOW    = int(WINDOW_DURATION / SAMPLING_INTERVAL)   # = 300
 LIVE_REFRESH_INTERVAL = 1.0                                        # matplotlib repaint cadence
 DATABASE_REFRESH      = 300.0                                      # seconds (5 min)
 
@@ -157,7 +157,7 @@ def partition_to_continious_rv_custom_dynamic(
     edges    = [lower_kb + i * step for i in range(num_bins + 1)]
 
     return (
-        [ContiniousRandomVariable(i, edges[i], edges[i + 1]) for i in range(num_bins)],
+        [ContiniousRandomVariable(f"bin_{i}", edges[i], edges[i + 1]) for i in range(num_bins)],
         num_bins,
     )
 
@@ -189,16 +189,16 @@ class ProcessHistogram:
             self.pid, peak_rss, self.max_system_ram_kb
         )
 
-        frequencies = [0] * num_bins
+        frequencies = [0.0] * num_bins
         for val in self.samples:
             placed = False
             for i, crv in enumerate(bins):
                 if crv.getLower() <= val < crv.getUpper():
-                    frequencies[i] += 1
+                    frequencies[i] += 1.0
                     placed = True
                     break
             if not placed:
-                frequencies[-1] += 1
+                frequencies[-1] += 1.0
 
         dist = ContiniousDistribution(
             f"Dynamic Tiered RAM Histogram PID {self.pid}",
@@ -223,38 +223,36 @@ class ProcessRAM_Graph:
         self.pid         = pid
         self.proc_name   = name
         self.time_points = []
-        self.ri_points   = []
+        self.rss_gb_points = []
 
-    def add_point(self, time_ns: int, ri: float):
-        self.time_points.append(float(time_ns))
-        self.ri_points.append(ri)
+    def add_point(self, time_sec: float, rss_gb: float):
+        self.time_points.append(time_sec)
+        self.rss_gb_points.append(rss_gb)
 
     def has_data(self) -> bool:
         return len(self.time_points) > 0
 
-    def compute_velocity(self) -> float:
-        if len(self.ri_points) < 2:
-            return 0.0
+    def compute_kinematics(self):
+        if len(self.rss_gb_points) < 2:
+            return [0.0] * len(self.rss_gb_points), [0.0] * len(self.rss_gb_points)
 
-        deltas = []
-        for i in range(1, len(self.ri_points)):
+        vels = [0.0]
+        for i in range(1, len(self.rss_gb_points)):
             dt = self.time_points[i] - self.time_points[i - 1]
             if dt > 0:
-                deltas.append((self.ri_points[i] - self.ri_points[i - 1]) / dt)
+                vels.append((self.rss_gb_points[i] - self.rss_gb_points[i - 1]) / dt)
+            else:
+                vels.append(0.0)
 
-        return sum(deltas) / len(deltas) if deltas else 0.0
+        accs = [0.0]
+        for i in range(1, len(vels)):
+            dt = self.time_points[i] - self.time_points[i - 1]
+            if dt > 0:
+                accs.append((vels[i] - vels[i - 1]) / dt)
+            else:
+                accs.append(0.0)
 
-    def compute_acceleration(self, previous_velocity: float, previous_time_ns: float) -> float:
-        current_velocity = self.compute_velocity()
-        if previous_time_ns <= 0:
-            return 0.0
-
-        current_time_ns = self.time_points[-1] if self.time_points else 0.0
-        dt = current_time_ns - previous_time_ns
-        if dt <= 0:
-            return 0.0
-
-        return (current_velocity - previous_velocity) / dt
+        return vels, accs
 
 
 # ---------------------------------------------------------
@@ -331,8 +329,6 @@ class DATABASE_INTEGRATION:
         variance: float,
         standard_deviation: float,
         mode: float,
-        velocity: float,
-        acceleration: float,
     ):
         if not self.available:
             return
@@ -344,12 +340,10 @@ class DATABASE_INTEGRATION:
                 variance=variance,
                 standard_deviation=standard_deviation,
                 mode_ram=mode,
-                velocity_ram=velocity,
-                acceleration_ram=acceleration,
             )
             log.debug(
-                "DB snapshot PID %d  mean=%.6f GB  vel=%.6e  acc=%.6e",
-                pid, mean, velocity, acceleration,
+                "DB snapshot PID %d  mean=%.6f GB",
+                pid, mean,
             )
         except Error as e:
             log.error("DB add_process_statistics(%d): %s", pid, e)
@@ -373,11 +367,6 @@ class DATABASE_INTEGRATION:
             return []
 
     def _apply_dynamic_time_axis(self, fig, ax, times):
-        """
-        Configures dynamic date/time formatting with a focused trading-style view.
-        Defaults to zooming into the most recent activity window while allowing 
-        full interactive pan/zoom out to broader historical ranges.
-        """
         clean_times = []
         for t in times:
             if isinstance(t, str):
@@ -412,50 +401,6 @@ class DATABASE_INTEGRATION:
         fig.autofmt_xdate()
         return clean_times
 
-    def live_plot_ram_velocity(self, pid: int):
-        rows = self.get_statistical_behavior_of_process(pid)
-        if not rows:
-            print(f"[DB Plot] No stats data for PID {pid}")
-            return
-
-        import matplotlib.pyplot as plt
-
-        raw_times = [r["timeSnapshot"] for r in rows]
-        vels      = [float(r["VelocityRAM"] or 0) for r in rows]
-
-        fig, ax = plt.subplots(figsize=(10, 4))
-        clean_times = self._apply_dynamic_time_axis(fig, ax, raw_times)
-
-        ax.plot(clean_times, vels, color="darkorange", linewidth=1.8, marker="o", markersize=4)
-        ax.set_title(f"PID {pid} — RAM Velocity over time (DB history)")
-        ax.set_xlabel("Snapshot time")
-        ax.set_ylabel("VelocityRAM  (ri / ns)")
-        ax.grid(True)
-        fig.tight_layout()
-        self._render_interactive(fig)
-
-    def live_plot_ram_acceleration(self, pid: int):
-        rows = self.get_statistical_behavior_of_process(pid)
-        if not rows:
-            print(f"[DB Plot] No stats data for PID {pid}")
-            return
-
-        import matplotlib.pyplot as plt
-
-        raw_times = [r["timeSnapshot"] for r in rows]
-        accs      = [float(r["AcclerationRAM"] or 0) for r in rows]
-
-        fig, ax = plt.subplots(figsize=(10, 4))
-        clean_times = self._apply_dynamic_time_axis(fig, ax, raw_times)
-
-        ax.plot(clean_times, accs, color="crimson", linewidth=1.8, marker="s", markersize=4)
-        ax.set_title(f"PID {pid} — RAM Acceleration over time (DB history)")
-        ax.set_xlabel("Snapshot time")
-        ax.set_ylabel("AccelerationRAM  (ri / ns²)")
-        ax.grid(True)
-        fig.tight_layout()
-        self._render_interactive(fig)
-
     def live_plot_variance(self, pid: int):
         rows = self.get_statistical_behavior_of_process(pid)
         if not rows:
@@ -478,6 +423,28 @@ class DATABASE_INTEGRATION:
         fig.tight_layout()
         self._render_interactive(fig)
 
+    def live_plot_std(self, pid: int):
+        rows = self.get_statistical_behavior_of_process(pid)
+        if not rows:
+            print(f"[DB Plot] No stats data for PID {pid}")
+            return
+
+        import matplotlib.pyplot as plt
+
+        raw_times = [r["timeSnapshot"] for r in rows]
+        stds      = [float(r["standardDeviation"] or 0) for r in rows]
+
+        fig, ax = plt.subplots(figsize=(10, 4))
+        clean_times = self._apply_dynamic_time_axis(fig, ax, raw_times)
+
+        ax.plot(clean_times, stds, color="teal", linewidth=1.8, marker="s", markersize=4)
+        ax.set_title(f"PID {pid} — RAM Standard Deviation over time (DB history)")
+        ax.set_xlabel("Snapshot time")
+        ax.set_ylabel("Standard Deviation (GB)")
+        ax.grid(True)
+        fig.tight_layout()
+        self._render_interactive(fig)
+
     def live_plot_mean(self, pid: int):
         rows = self.get_statistical_behavior_of_process(pid)
         if not rows:
@@ -496,6 +463,28 @@ class DATABASE_INTEGRATION:
         ax.set_title(f"PID {pid} — Mean RAM over time (DB history)")
         ax.set_xlabel("Snapshot time")
         ax.set_ylabel("Mean RAM  (GB)")
+        ax.grid(True)
+        fig.tight_layout()
+        self._render_interactive(fig)
+
+    def live_plot_mode(self, pid: int):
+        rows = self.get_statistical_behavior_of_process(pid)
+        if not rows:
+            print(f"[DB Plot] No stats data for PID {pid}")
+            return
+
+        import matplotlib.pyplot as plt
+
+        raw_times = [r["timeSnapshot"] for r in rows]
+        modes     = [float(r["modeRAM"] or 0) for r in rows]
+
+        fig, ax = plt.subplots(figsize=(10, 4))
+        clean_times = self._apply_dynamic_time_axis(fig, ax, raw_times)
+
+        ax.plot(clean_times, modes, color="mediumseagreen", linewidth=1.8, marker="p", markersize=4)
+        ax.set_title(f"PID {pid} — Mode RAM over time (DB history)")
+        ax.set_xlabel("Snapshot time")
+        ax.set_ylabel("Mode RAM (GB)")
         ax.grid(True)
         fig.tight_layout()
         self._render_interactive(fig)
@@ -708,13 +697,13 @@ class Commands:
 
         if cmd.startswith("db plot") and monitor is not None:
             if len(tokens) < 4 or not tokens[3].isdigit():
-                print("Usage: db plot --vel|--acc|--var|--mean <pid>")
+                print("Usage: db plot --var|--std|--mean|--mode <pid>")
                 return
 
             flag = tokens[2]
             pid_arg = int(tokens[3])
 
-            if flag not in {"--vel", "--acc", "--var", "--mean"}:
+            if flag not in {"--var", "--std", "--mean", "--mode"}:
                 print(f"Unknown db plot flag: {flag}")
                 return
 
@@ -888,9 +877,15 @@ class Monitor:
 
         self.live_plot_active = False
         self.live_target_pids = []
-        self.fig              = None
-        self.axes             = None
+        
+        # Dual figure architecture: Figure 1 (RAM GB), Figure 2 (Kinematics)
+        self.fig_ram          = None
+        self.axes_ram         = None
+        self.fig_kinematics   = None
+        self.axes_kinematics  = None
         self.active_db_fig    = None
+
+        self.start_time_sec   = time.time()
 
         self.db_plot_requests = queue.Queue()
 
@@ -898,19 +893,15 @@ class Monitor:
             time_period_save_to_memory=DATABASE_REFRESH
         )
 
-        self.last_db_flush_time    = {}
-        self.last_velocity         = {}
-        self.last_velocity_time_ns = {}
+        self.last_db_flush_time = {}
 
     def _on_close(self, event):
-        """
-        Explicitly triggered when user clicks 'X' on any plot figure.
-        Resets figure pointers, closes all backend windows, and forces GC.
-        """
         self.live_plot_active = False
-        self.fig = None
-        self.axes = None
-        self.active_db_fig = None
+        self.fig_ram          = None
+        self.axes_ram         = None
+        self.fig_kinematics   = None
+        self.axes_kinematics  = None
+        self.active_db_fig    = None
 
         import matplotlib.pyplot as plt
         plt.close("all")
@@ -925,9 +916,7 @@ class Monitor:
         self.RAM_graph[pid]  = ProcessRAM_Graph(pid, name)
         self.fsm_state[pid]  = STATE_HISTOGRAM
 
-        self.last_db_flush_time[pid]    = time.time()
-        self.last_velocity[pid]         = 0.0
-        self.last_velocity_time_ns[pid] = 0.0
+        self.last_db_flush_time[pid] = time.time()
 
         self.db_integration.ensure_process_exists(pid, burst_time=0.0)
 
@@ -945,18 +934,11 @@ class Monitor:
             self.fsm_state[pid] = STATE_HISTOGRAM
             return
 
-        mode_kb    = dist.getMode()
-        ram_max_kb = self.ram_max[pid]
-        ri         = mode_kb / ram_max_kb
-        ts         = time.time_ns()
-
-        self.RAM_graph[pid].add_point(ts, ri)
-        hist.reset_counts()
-
         elapsed_since_flush = time.time() - self.last_db_flush_time.get(pid, 0.0)
         if elapsed_since_flush >= DATABASE_REFRESH:
             self.fsm_state[pid] = STATE_UPDATE_DATABASE
         else:
+            hist.reset_counts()
             self.fsm_state[pid] = STATE_HISTOGRAM
 
     def _save_to_database(self, pid: int):
@@ -983,12 +965,6 @@ class Monitor:
         std_dev_gb  = std_dev_kb / KB_TO_GB
         mode_gb     = mode_kb / KB_TO_GB
 
-        velocity     = graph.compute_velocity()
-        acceleration = graph.compute_acceleration(
-            previous_velocity = self.last_velocity.get(pid, 0.0),
-            previous_time_ns  = self.last_velocity_time_ns.get(pid, 0.0),
-        )
-
         snapshot_time = datetime.now()
 
         self.db_integration.add_process_statistics(
@@ -998,18 +974,14 @@ class Monitor:
             variance           = variance_gb,
             standard_deviation = std_dev_gb,
             mode               = mode_gb,
-            velocity           = velocity,
-            acceleration       = acceleration,
         )
 
-        current_time_ns = graph.time_points[-1] if graph.time_points else 0.0
-        self.last_velocity[pid]         = velocity
-        self.last_velocity_time_ns[pid] = current_time_ns
-        self.last_db_flush_time[pid]    = time.time()
+        hist.reset_counts()
+        self.last_db_flush_time[pid] = time.time()
 
         log.info(
-            "DB flush PID %d  mean=%.6f GB  var=%.6e GB²  vel=%.4e  acc=%.4e",
-            pid, mean_gb, variance_gb, velocity, acceleration,
+            "DB flush PID %d  mean=%.6f GB  var=%.6e GB²",
+            pid, mean_gb, variance_gb,
         )
 
         self.fsm_state[pid] = STATE_HISTOGRAM
@@ -1027,21 +999,29 @@ class Monitor:
             print("No processes to plot.")
             return
 
-        self.fig, self.axes = plt.subplots(num_plots, 1, figsize=(10, 8))
+        # Figure 1: RSS RAM Plot in GB vs Time
+        self.fig_ram, self.axes_ram = plt.subplots(num_plots, 1, figsize=(10, 3.5 * num_plots))
         if num_plots == 1:
-            self.axes = [self.axes]
+            self.axes_ram = [self.axes_ram]
 
-        self.fig.canvas.mpl_connect("close_event", self._on_close)
+        # Figure 2: Kinematics (Velocity & Acceleration on same curve figure)
+        self.fig_kinematics, self.axes_kinematics = plt.subplots(num_plots, 1, figsize=(10, 3.5 * num_plots))
+        if num_plots == 1:
+            self.axes_kinematics = [self.axes_kinematics]
+
+        self.fig_ram.canvas.mpl_connect("close_event", self._on_close)
+        self.fig_kinematics.canvas.mpl_connect("close_event", self._on_close)
+
         self.live_plot_active = True
         print(f"Live GUI Plotting enabled for PIDs: {target_pids}")
 
     def _update_live_plot_frame(self, force_redraw: bool = False):
-        if not self.live_plot_active or self.fig is None:
+        if not self.live_plot_active or self.fig_ram is None or self.fig_kinematics is None:
             return
 
         import matplotlib.pyplot as plt
 
-        if not plt.fignum_exists(self.fig.number):
+        if not plt.fignum_exists(self.fig_ram.number) or not plt.fignum_exists(self.fig_kinematics.number):
             self._on_close(None)
             return
 
@@ -1050,35 +1030,78 @@ class Monitor:
                 pids = self.live_target_pids[:3]
 
                 for i, pid in enumerate(pids):
-                    ax = self.axes[i]
-                    ax.clear()
+                    ax_ram  = self.axes_ram[i]
+                    ax_kin  = self.axes_kinematics[i]
+
+                    ax_ram.clear()
+                    ax_kin.clear()
 
                     graph = self.RAM_graph.get(pid)
                     if graph and graph.has_data():
-                        times = list(graph.time_points)
-                        ris   = list(graph.ri_points)
-                        ax.plot(
+                        times      = list(graph.time_points)
+                        rss_gb_pts = list(graph.rss_gb_points)
+                        vels, accs = graph.compute_kinematics()
+
+                        proc_label = f"{graph.proc_name} (PID {pid})"
+
+                        # 1. Figure 1 Plot: Live RSS RAM Graph (GB vs seconds)
+                        ax_ram.plot(
                             times,
-                            ris,
-                            color="royalblue",
+                            rss_gb_pts,
+                            color="steelblue",
                             linewidth=1.8,
                             marker="o",
-                            markersize=4,
+                            markersize=3,
+                            label="RSS RAM (GB)",
                         )
-                        ax.set_title(f"{graph.proc_name} (PID {pid}) — ri vs time_ns")
+                        ax_ram.set_title(f"{proc_label} — Live RSS Memory")
+                        ax_ram.set_xlabel("Time (seconds)")
+                        ax_ram.set_ylabel("RAM (GB)")
+                        ax_ram.grid(True)
+                        ax_ram.legend(loc="upper left")
+
+                        # 2. Figure 2 Plot: Velocity & Acceleration on same axes
+                        ax_kin.plot(
+                            times,
+                            vels,
+                            color="darkorange",
+                            linewidth=1.5,
+                            marker=".",
+                            label="Velocity (GB/s)",
+                        )
+                        ax_kin.plot(
+                            times,
+                            accs,
+                            color="crimson",
+                            linewidth=1.5,
+                            marker="x",
+                            label="Acceleration (GB/s²)",
+                        )
+                        ax_kin.set_title(f"{proc_label} — Memory Kinematics (Velocity & Acceleration)")
+                        ax_kin.set_xlabel("Time (seconds)")
+                        ax_kin.set_ylabel("Kinematics Scale")
+                        ax_kin.grid(True)
+                        ax_kin.legend(loc="upper left")
+
                     else:
                         name = get_process_name(pid) or "Process"
-                        ax.set_title(f"{name} (PID {pid}) — waiting for first 30 s window…")
+                        ax_ram.set_title(f"{name} (PID {pid}) — Waiting for live data...")
+                        ax_kin.set_title(f"{name} (PID {pid}) — Waiting for live data...")
+                        ax_ram.grid(True)
+                        ax_kin.grid(True)
 
-                    ax.set_xlabel("time (ns)")
-                    ax.set_ylabel("ri = mode_kb / RAM_max")
-                    ax.set_ylim(0, 1)
-                    ax.grid(True)
+                try:
+                    self.fig_ram.tight_layout()
+                    self.fig_kinematics.tight_layout()
+                except Exception:
+                    pass
 
-                self.fig.canvas.draw_idle()
+                self.fig_ram.canvas.draw_idle()
+                self.fig_kinematics.canvas.draw_idle()
 
-            # Pump OS window events to avoid "Not Responding" freeze
-            self.fig.canvas.start_event_loop(0.001)
+            # Pump GUI event loops to prevent "Not Responding" freeze
+            self.fig_ram.canvas.start_event_loop(0.001)
+            self.fig_kinematics.canvas.start_event_loop(0.001)
 
         except Exception as e:
             log.error("Error updating live plot frame: %s", e)
@@ -1098,14 +1121,14 @@ class Monitor:
 
             self._on_close(None)
 
-            if flag == "--vel":
-                self.db_integration.live_plot_ram_velocity(pid)
-            elif flag == "--acc":
-                self.db_integration.live_plot_ram_acceleration(pid)
-            elif flag == "--var":
+            if flag == "--var":
                 self.db_integration.live_plot_variance(pid)
+            elif flag == "--std":
+                self.db_integration.live_plot_std(pid)
             elif flag == "--mean":
                 self.db_integration.live_plot_mean(pid)
+            elif flag == "--mode":
+                self.db_integration.live_plot_mode(pid)
 
             curr_fig = plt.gcf()
             if curr_fig:
@@ -1120,6 +1143,7 @@ class Monitor:
         while self.running:
             now          = time.time()
             current_time = time.time_ns()
+            elapsed_sec  = now - self.start_time_sec
 
             self._render_pending_db_plots()
 
@@ -1160,6 +1184,10 @@ class Monitor:
                     self.previous_cpu[pid] = snapshot
                     self.data.setdefault(pid, []).append(snapshot)
 
+                    # Update RAM graph in GB every second
+                    rss_gb = snapshot["rss_kb"] / (1024.0 * 1024.0)
+                    self.RAM_graph[pid].add_point(elapsed_sec, rss_gb)
+
                     if self.fsm_state[pid] == STATE_HISTOGRAM:
                         self.histograms[pid].record(snapshot["rss_kb"])
                         self.histograms[pid].increment_sample()
@@ -1179,10 +1207,9 @@ class Monitor:
             if cmd:
                 self.commands.execute(cmd, latest_snapshots, self)
 
-            # Continuous OS GUI event loop pumping for both Live and DB plots
             import matplotlib.pyplot as plt
 
-            if self.live_plot_active and self.fig is not None:
+            if self.live_plot_active and self.fig_ram is not None and self.fig_kinematics is not None:
                 should_redraw = (now - last_plot_time >= LIVE_REFRESH_INTERVAL)
                 self._update_live_plot_frame(force_redraw=should_redraw)
                 if should_redraw:
@@ -1228,7 +1255,7 @@ def main():
     log.info(f"Monitoring started — tracking {len(monitor.target_pids)} processes")
     log.info(
         f"Window: {SAMPLES_PER_WINDOW} samples x {args.interval}s "
-        f"= {WINDOW_DURATION}s per scatter point"
+        f"= {WINDOW_DURATION}s per histogram window"
     )
     log.info(
         f"DB flush period: {DATABASE_REFRESH}s  "
