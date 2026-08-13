@@ -1,0 +1,18 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Run Python as Admin",
+      "type": "process",
+      "command": "powershell.exe",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        "Start-Process powershell -ArgumentList '-NoExit', '-Command', '$env:PYTHONPATH=\"${workspaceFolder}\"; cd \"${workspaceFolder}\"; & \"${command:python.interpreterPath}\" -m Documents.OS_proj.OS.master' -Verb RunAs -WorkingDirectory '${workspaceFolder}'"
+      ],
+      "problemMatcher": []
+    }
+  ]
+}

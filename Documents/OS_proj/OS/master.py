@@ -10,7 +10,6 @@ import os
 import gc
 import sys
 import time
-import math
 import queue
 import signal
 import argparse
@@ -18,6 +17,7 @@ import logging
 import threading
 import warnings
 import ctypes
+from collections import deque
 from ctypes import wintypes
 from datetime import datetime, timedelta
 from mysql.connector import Error
@@ -26,18 +26,7 @@ import psutil
 import matplotlib.dates as mdates
 
 from Documents.OS_proj.STATS.ContiniousRandomVariable import ContiniousRandomVariable
-from Documents.OS_proj.STATS.DiscreteRandomVariable import DiscreteRandomVariable
-from Documents.OS_proj.STATS.RandomVariable import RandomVariable
-
-from Documents.OS_proj.STATS.Univariate.Distributions import (
-    ContiniousDistribution,
-    DiscreteDistribution,
-)
-
-from Documents.OS_proj.STATS.Bivariate.Plots import (
-    ScatterPlot,
-    DiscreteFrequencyTable,
-)
+from Documents.OS_proj.STATS.Univariate.Distributions import ContiniousDistribution
 from Documents.OS_proj.DataBaseConnector.mySQL_Backend import Database
 
 
@@ -48,191 +37,338 @@ logging.basicConfig(
 
 log = logging.getLogger("master")
 
-# Suppress Matplotlib tight_layout user warnings gracefully
 warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib")
 
 # ---------------------------------------------------------
 # Window / refresh constants
 # ---------------------------------------------------------
 
-SAMPLING_INTERVAL     = 1.0                                        
-WINDOW_DURATION       = 300                                        
-SAMPLES_PER_WINDOW    = int(WINDOW_DURATION / SAMPLING_INTERVAL)   
-LIVE_REFRESH_INTERVAL = 1.0                                        
-DATABASE_REFRESH      = 300.0                                      
+SAMPLING_INTERVAL     = 1.0
+WINDOW_DURATION       = 300
+SAMPLES_PER_WINDOW    = int(WINDOW_DURATION / SAMPLING_INTERVAL)
+LIVE_REFRESH_INTERVAL = 1.0
+DATABASE_REFRESH      = 300.0
+MAX_GRAPH_POINTS      = 10_000
 
 # Microsoft-Windows-Heap Provider GUID
 HEAP_PROVIDER_GUID = "{E61C8C90-1C48-4E58-B78A-0611367E442B}"
-
 
 # ---------------------------------------------------------
 # Ctypes Native Windows ETW Consumer Engine
 # ---------------------------------------------------------
 
+PROCESS_TRACE_MODE_REAL_TIME    = 0x00000100
+PROCESS_TRACE_MODE_EVENT_RECORD = 0x10000000
+WNODE_FLAG_TRACED_GUID          = 0x00020000
+EVENT_TRACE_REAL_TIME_MODE      = 0x00000100
+EVENT_TRACE_CONTROL_STOP        = 1
+INVALID_HANDLE_VALUE            = ctypes.c_uint64(-1).value
+
+
 class GUID(ctypes.Structure):
     _fields_ = [
-        ("Data1", wintypes.DWORD),
-        ("Data2", wintypes.WORD),
-        ("Data3", wintypes.WORD),
-        ("Data4", ctypes.c_byte * 8),
+        ("Data1", ctypes.c_ulong),
+        ("Data2", ctypes.c_ushort),
+        ("Data3", ctypes.c_ushort),
+        ("Data4", ctypes.c_ubyte * 8),
     ]
 
-    def __init__(self, guid_str):
+    def __init__(self, guid_str=""):
         super().__init__()
-        import uuid
-        u = uuid.UUID(guid_str)
-        self.Data1 = u.time_low
-        self.Data2 = u.time_mid
-        self.Data3 = u.time_hi_version
-        for i, b in enumerate(u.bytes[8:]):
-            self.Data4[i] = b
+        if guid_str:
+            import uuid
+            u = uuid.UUID(guid_str)
+            self.Data1 = u.time_low
+            self.Data2 = u.time_mid
+            self.Data3 = u.time_hi_version
+            for i, b in enumerate(u.bytes[8:]):
+                self.Data4[i] = b
 
-class EVENT_DESCRIPTOR(ctypes.Structure):
+
+class WNODE_HEADER(ctypes.Structure):
     _fields_ = [
-        ("Id", wintypes.WORD),
-        ("Version", ctypes.c_ubyte),
-        ("Channel", ctypes.c_ubyte),
-        ("Level", ctypes.c_ubyte),
-        ("Opcode", ctypes.c_ubyte),
-        ("Task", wintypes.WORD),
-        ("Keyword", ctypes.c_uint64),
+        ("BufferSize",    ctypes.c_ulong),
+        ("ProviderId",    ctypes.c_ulong),
+        ("HistoricalContext", ctypes.c_uint64),
+        ("TimeStamp",     ctypes.c_int64),
+        ("Guid",          GUID),
+        ("ClientContext", ctypes.c_ulong),
+        ("Flags",         ctypes.c_ulong),
     ]
 
-class EVENT_HEADER(ctypes.Structure):
-    _fields_ = [
-        ("Size", wintypes.WORD),
-        ("HeaderType", wintypes.WORD),
-        ("Flags", wintypes.WORD),
-        ("EventProperty", wintypes.WORD),
-        ("ThreadId", wintypes.DWORD),
-        ("ProcessId", wintypes.DWORD),
-        ("TimeStamp", ctypes.c_int64),
-        ("ProviderId", GUID),
-        ("EventDescriptor", EVENT_DESCRIPTOR),
-        ("KernelTime", wintypes.DWORD),
-        ("UserTime", wintypes.DWORD),
-        ("ActivityId", GUID),
-    ]
-
-class ETW_BUFFER_HEADER(ctypes.Structure):
-    _fields_ = [("Reserved", ctypes.c_byte * 64)]
-
-class EVENT_RECORD(ctypes.Structure):
-    pass
-
-EVENT_RECORD_PTR = ctypes.POINTER(EVENT_RECORD)
-
-EVENT_RECORD._fields_ = [
-    ("EventHeader", EVENT_HEADER),
-    ("BufferContext", ctypes.c_byte * 4),
-    ("ExtendedDataCount", wintypes.WORD),
-    ("UserDataLength", wintypes.WORD),
-    ("ExtendedData", ctypes.c_void_p),
-    ("UserData", ctypes.c_void_p),
-    ("UserContext", ctypes.c_void_p),
-]
-
-EVENT_RECORD_CALLBACK = ctypes.WINFUNCTYPE(None, EVENT_RECORD_PTR)
-
-class EVENT_TRACE_LOGFILE(ctypes.Structure):
-    _fields_ = [
-        ("LoggerName", wintypes.LPWSTR),
-        ("LogFileName", wintypes.LPWSTR),
-        ("LogFileMode", wintypes.ULONG),
-        ("BufferLength", wintypes.ULONG),
-        ("BufferSize", wintypes.ULONG),
-        ("Filled", wintypes.ULONG),
-        ("EventsLost", wintypes.ULONG),
-        ("OldEventCallback", ctypes.c_void_p),
-        ("BufferCallback", ctypes.c_void_p),
-        ("BuffersRead", wintypes.ULONG),
-        ("EventCallback", EVENT_RECORD_CALLBACK),
-        ("Context", ctypes.c_void_p),
-    ]
 
 class EVENT_TRACE_PROPERTIES(ctypes.Structure):
     _fields_ = [
-        ("Wnode_BufferSize", wintypes.ULONG),
-        ("Wnode_Guid", GUID),
-        ("Wnode_ClientContext", wintypes.ULONG),
-        ("Wnode_Flags", wintypes.ULONG),
-        ("BufferSize", wintypes.ULONG),
-        ("MinimumBuffers", wintypes.ULONG),
-        ("MaximumBuffers", wintypes.ULONG),
-        ("MaximumFileSize", wintypes.ULONG),
-        ("LogFileMode", wintypes.ULONG),
-        ("FlushTimer", wintypes.ULONG),
-        ("EnableFlags", wintypes.ULONG),
-        ("AgeLimit", wintypes.LONG),
-        ("NumberOfBuffers", wintypes.ULONG),
-        ("FreeBuffers", wintypes.ULONG),
-        ("EventsLost", wintypes.ULONG),
-        ("BuffersWritten", wintypes.ULONG),
-        ("LogBuffersLost", wintypes.ULONG),
-        ("RealTimeBuffersLost", wintypes.ULONG),
-        ("LoggerThreadId", wintypes.HANDLE),
-        ("LogFileNameOffset", wintypes.ULONG),
-        ("LoggerNameOffset", wintypes.ULONG),
+        ("Wnode",                WNODE_HEADER),
+        ("BufferSize",           ctypes.c_ulong),
+        ("MinimumBuffers",       ctypes.c_ulong),
+        ("MaximumBuffers",       ctypes.c_ulong),
+        ("MaximumFileSize",      ctypes.c_ulong),
+        ("LogFileMode",          ctypes.c_ulong),
+        ("FlushTimer",           ctypes.c_ulong),
+        ("EnableFlags",          ctypes.c_ulong),
+        ("AgeLimit",             ctypes.c_long),
+        ("NumberOfBuffers",      ctypes.c_ulong),
+        ("FreeBuffers",          ctypes.c_ulong),
+        ("EventsLost",           ctypes.c_ulong),
+        ("BuffersWritten",       ctypes.c_ulong),
+        ("LogBuffersLost",       ctypes.c_ulong),
+        ("RealTimeBuffersLost",  ctypes.c_ulong),
+        ("LoggerThreadId",       ctypes.c_void_p),
+        ("LogFileNameOffset",    ctypes.c_ulong),
+        ("LoggerNameOffset",     ctypes.c_ulong),
     ]
 
 
+class EVENT_DESCRIPTOR(ctypes.Structure):
+    _fields_ = [
+        ("Id",      ctypes.c_ushort),
+        ("Version", ctypes.c_ubyte),
+        ("Channel", ctypes.c_ubyte),
+        ("Level",   ctypes.c_ubyte),
+        ("Opcode",  ctypes.c_ubyte),
+        ("Task",    ctypes.c_ushort),
+        ("Keyword", ctypes.c_uint64),
+    ]
+
+
+class EVENT_HEADER(ctypes.Structure):
+    _fields_ = [
+        ("Size",            ctypes.c_ushort),
+        ("HeaderType",      ctypes.c_ushort),
+        ("Flags",           ctypes.c_ushort),
+        ("EventProperty",   ctypes.c_ushort),
+        ("ThreadId",        ctypes.c_ulong),
+        ("ProcessId",       ctypes.c_ulong),
+        ("TimeStamp",       ctypes.c_int64),
+        ("ProviderId",      GUID),
+        ("EventDescriptor", EVENT_DESCRIPTOR),
+        ("KernelTime",      ctypes.c_ulong),
+        ("UserTime",        ctypes.c_ulong),
+        ("ActivityId",      GUID),
+    ]
+
+
+class ETW_BUFFER_CONTEXT(ctypes.Structure):
+    _fields_ = [
+        ("ProcessorNumber", ctypes.c_ubyte),
+        ("Alignment",       ctypes.c_ubyte),
+        ("LoggerId",        ctypes.c_ushort),
+    ]
+
+
+class EVENT_RECORD(ctypes.Structure):
+    _fields_ = [
+        ("EventHeader",       EVENT_HEADER),
+        ("BufferContext",     ETW_BUFFER_CONTEXT),
+        ("ExtendedDataCount", ctypes.c_ushort),
+        ("UserDataLength",    ctypes.c_ushort),
+        ("ExtendedData",      ctypes.c_void_p),
+        ("UserData",          ctypes.c_void_p),
+        ("UserContext",       ctypes.c_void_p),
+    ]
+
+
+EVENT_RECORD_CALLBACK = ctypes.WINFUNCTYPE(None, ctypes.POINTER(EVENT_RECORD))
+
+
+class TRACE_LOGFILE_HEADER(ctypes.Structure):
+    _fields_ = [
+        ("BufferSize",         ctypes.c_ulong),
+        ("MajorVersion",       ctypes.c_ubyte),
+        ("MinorVersion",       ctypes.c_ubyte),
+        ("SubVersion",         ctypes.c_ubyte),
+        ("SubMinorVersion",    ctypes.c_ubyte),
+        ("ProviderVersion",    ctypes.c_ulong),
+        ("NumberOfProcessors", ctypes.c_ulong),
+        ("EndTime",            ctypes.c_int64),
+        ("TimerResolution",    ctypes.c_ulong),
+        ("MaximumFileSize",    ctypes.c_ulong),
+        ("LogFileMode",        ctypes.c_ulong),
+        ("BuffersWritten",     ctypes.c_ulong),
+        ("StartBuffers",       ctypes.c_ulong),
+        ("PointerSize",        ctypes.c_ulong),
+        ("EventsLost",         ctypes.c_ulong),
+        ("CpuSpeedInMHz",      ctypes.c_ulong),
+        ("LoggerName",         ctypes.c_void_p),
+        ("LogFileName",        ctypes.c_void_p),
+        ("TimeZone",           ctypes.c_byte * 176),
+        ("BootTime",           ctypes.c_int64),
+        ("PerfFreq",           ctypes.c_int64),
+        ("StartTime",          ctypes.c_int64),
+        ("ReservedFlags",      ctypes.c_ulong),
+        ("BuffersLost",        ctypes.c_ulong),
+    ]
+
+
+class EVENT_TRACE_LOGFILE(ctypes.Structure):
+    _fields_ = [
+        ("LogFileName",      ctypes.c_wchar_p),
+        ("LoggerName",       ctypes.c_wchar_p),
+        ("CurrentTime",      ctypes.c_int64),
+        ("BuffersRead",      ctypes.c_ulong),
+        ("ProcessTraceMode", ctypes.c_ulong),
+        ("CurrentEvent",     EVENT_RECORD),
+        ("LogfileHeader",    TRACE_LOGFILE_HEADER),
+        ("BufferCallback",   ctypes.c_void_p),
+        ("BufferSize",       ctypes.c_ulong),
+        ("Filled",           ctypes.c_ulong),
+        ("EventsLost",       ctypes.c_ulong),
+        ("EventCallback",    EVENT_RECORD_CALLBACK),
+        ("IsKernelTrace",    ctypes.c_ulong),
+        ("Context",          ctypes.c_void_p),
+    ]
+
+
+def _make_props_buffer(session_name: str):
+    name_bytes      = (session_name + "\0").encode("utf-16-le")
+    props_size      = ctypes.sizeof(EVENT_TRACE_PROPERTIES) + len(name_bytes) + 512
+    buf             = ctypes.create_string_buffer(props_size)
+    ptr             = ctypes.cast(buf, ctypes.POINTER(EVENT_TRACE_PROPERTIES))
+
+    ptr[0].Wnode.BufferSize  = props_size
+    ptr[0].Wnode.Flags       = WNODE_FLAG_TRACED_GUID
+    ptr[0].LogFileMode       = EVENT_TRACE_REAL_TIME_MODE
+    ptr[0].LoggerNameOffset  = ctypes.sizeof(EVENT_TRACE_PROPERTIES)
+
+    name_offset = ctypes.sizeof(EVENT_TRACE_PROPERTIES)
+    ctypes.memmove(
+        ctypes.addressof(buf) + name_offset,
+        name_bytes,
+        len(name_bytes)
+    )
+
+    return buf, ptr
+
+
 class NativeETWConsumer:
+
     def __init__(self, target_pids, event_callback):
-        self.target_pids = target_pids
-        self.user_callback = event_callback
-        self.session_name = f"HeapTracerSession_{os.getpid()}"
-        self.running = False
-        self.trace_handle = None
+        self.target_pids    = set(target_pids)
+        self.user_callback  = event_callback
+        self.session_name   = f"HeapTracerSession_{os.getpid()}"
+        self.running        = False
+        self.trace_handle   = None
         self.session_handle = None
 
-        self._advapi32 = ctypes.windll.advapi32
+        self._advapi32   = ctypes.windll.advapi32
+        self._kernel32   = ctypes.windll.kernel32
+
+        TRACEHANDLE = ctypes.c_uint64
+
+        self._advapi32.StartTraceW.argtypes = [
+            ctypes.POINTER(TRACEHANDLE),
+            ctypes.c_wchar_p,
+            ctypes.POINTER(EVENT_TRACE_PROPERTIES),
+        ]
+        self._advapi32.StartTraceW.restype = ctypes.c_ulong
+
+        self._advapi32.ControlTraceW.argtypes = [
+            TRACEHANDLE,
+            ctypes.c_wchar_p,
+            ctypes.POINTER(EVENT_TRACE_PROPERTIES),
+            ctypes.c_ulong,
+        ]
+        self._advapi32.ControlTraceW.restype = ctypes.c_ulong
+
+        self._advapi32.EnableTraceEx2.argtypes = [
+            TRACEHANDLE,
+            ctypes.POINTER(GUID),
+            ctypes.c_ulong,
+            ctypes.c_ubyte,
+            ctypes.c_uint64,
+            ctypes.c_uint64,
+            ctypes.c_ulong,
+            ctypes.c_void_p,
+        ]
+        self._advapi32.EnableTraceEx2.restype = ctypes.c_ulong
+
+        self._advapi32.OpenTraceW.argtypes = [
+            ctypes.POINTER(EVENT_TRACE_LOGFILE)
+        ]
+        self._advapi32.OpenTraceW.restype = TRACEHANDLE
+
+        self._advapi32.ProcessTrace.argtypes = [
+            ctypes.POINTER(TRACEHANDLE),
+            ctypes.c_ulong,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        self._advapi32.ProcessTrace.restype = ctypes.c_ulong
+
+        self._advapi32.CloseTrace.argtypes = [
+            TRACEHANDLE
+        ]
+        self._advapi32.CloseTrace.restype = ctypes.c_ulong
+
         self._c_callback = EVENT_RECORD_CALLBACK(self._internal_callback)
+
+    def add_target_pid(self, pid: int):
+        self.target_pids.add(pid)
 
     def _internal_callback(self, record_ptr):
         if not record_ptr:
             return
-        rec = record_ptr.contents
-        pid = rec.EventHeader.ProcessId
-
-        if pid in self.target_pids:
+        try:
+            rec      = record_ptr[0]
+            pid      = rec.EventHeader.ProcessId
             event_id = rec.EventHeader.EventDescriptor.Id
-            user_data = rec.UserData
             data_len = rec.UserDataLength
+            userdata = rec.UserData
 
-            if event_id in (1, 33) and data_len >= 8:
-                alloc_bytes = ctypes.cast(user_data, ctypes.POINTER(ctypes.c_uint64)).contents.value
-                self.user_callback(pid, "malloc", alloc_bytes)
+            if pid not in self.target_pids:
+                return
+            if not userdata or data_len < 8:
+                return
 
-            elif event_id in (2, 34) and data_len >= 8:
-                free_bytes = ctypes.cast(user_data, ctypes.POINTER(ctypes.c_uint64)).contents.value
-                self.user_callback(pid, "free", free_bytes)
+            val = ctypes.cast(userdata, ctypes.POINTER(ctypes.c_uint64))[0]
+
+            # Heap Alloc: 1, 33 | Heap Free: 2, 34
+            if event_id in (1, 33):
+                self.user_callback(pid, "malloc", val)
+            elif event_id in (2, 34):
+                self.user_callback(pid, "free", val)
+
+        except Exception as e:
+            log.error("ETW callback error: %s", e)
+
+    def _stop_existing_session(self):
+        buf, ptr = _make_props_buffer(self.session_name)
+        self._advapi32.ControlTraceW(
+            0,
+            self.session_name,
+            ptr,
+            EVENT_TRACE_CONTROL_STOP
+        )
 
     def start(self):
         self.running = True
-        
-        props_size = ctypes.sizeof(EVENT_TRACE_PROPERTIES) + 512
-        buf = ctypes.create_string_buffer(props_size)
-        props = ctypes.cast(buf, ctypes.POINTER(EVENT_TRACE_PROPERTIES)).contents
-        props.Wnode_BufferSize = props_size
-        props.Wnode_Flags = 0x00020000
-        props.LogFileMode = 0x00000100
-        props.LoggerNameOffset = ctypes.sizeof(EVENT_TRACE_PROPERTIES)
+        self._stop_existing_session()
+
+        buf, ptr = _make_props_buffer(self.session_name)
 
         session_guid = GUID("{11223344-5566-7788-9900-AABBCCDDEEFF}")
-        props.Wnode_Guid = session_guid
+        ptr[0].Wnode.Guid = session_guid
 
-        sess_handle = wintypes.HANDLE()
-        self._advapi32.ControlTraceW(0, self.session_name, ctypes.byref(props), 1)
+        sess_handle = ctypes.c_uint64(0)
+        res = self._advapi32.StartTraceW(
+            ctypes.byref(sess_handle),
+            self.session_name,
+            ptr
+        )
 
-        res = self._advapi32.StartTraceW(ctypes.byref(sess_handle), self.session_name, ctypes.byref(props))
         if res != 0:
-            log.warning("ETW StartTrace failed with code %d (Run terminal as Administrator)", res)
+            log.error(
+                "ETW StartTrace failed — error code %d. "
+                "Run as Administrator.", res
+            )
             return
 
         self.session_handle = sess_handle
-        heap_guid = GUID(HEAP_PROVIDER_GUID)
+        log.info("ETW session started successfully.")
 
-        self._advapi32.EnableTraceEx2(
+        heap_guid = GUID(HEAP_PROVIDER_GUID)
+        res = self._advapi32.EnableTraceEx2(
             sess_handle,
             ctypes.byref(heap_guid),
             1,
@@ -242,29 +378,48 @@ class NativeETWConsumer:
             0,
             None
         )
+        if res != 0:
+            log.error("ETW EnableTraceEx2 failed — error code %d.", res)
+            return
 
         logfile = EVENT_TRACE_LOGFILE()
-        logfile.LoggerName = ctypes.c_wchar_p(self.session_name)
-        logfile.LogFileMode = 0x00000100 | 0x10000000
+        logfile.LoggerName       = self.session_name
+        logfile.ProcessTraceMode = (
+            PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD
+        )
         logfile.EventCallback = self._c_callback
 
         t_handle = self._advapi32.OpenTraceW(ctypes.byref(logfile))
+
+        if t_handle == INVALID_HANDLE_VALUE:
+            err = self._kernel32.GetLastError()
+            log.error("ETW OpenTraceW failed — error code %d.", err)
+            return
+
         self.trace_handle = t_handle
+        log.info("ETW trace handle opened. Starting ProcessTrace thread.")
 
         def _process_thread():
-            handles = (wintypes.HANDLE * 1)(t_handle)
-            self._advapi32.ProcessTrace(handles, 1, None, None)
+            handles = (ctypes.c_uint64 * 1)(t_handle)
+            res = self._advapi32.ProcessTrace(handles, 1, None, None)
+            if res != 0:
+                log.error("ETW ProcessTrace exited with code %d.", res)
 
-        threading.Thread(target=_process_thread, daemon=True).start()
-        log.info("Native Windows ETW Session started successfully for Microsoft-Windows-Heap provider.")
+        threading.Thread(target=_process_thread, daemon=True, name="ETWProcessTrace").start()
+        log.info("ETW session active — Microsoft-Windows-Heap provider running.")
 
     def stop(self):
         if self.session_handle:
-            props_size = ctypes.sizeof(EVENT_TRACE_PROPERTIES) + 512
-            buf = ctypes.create_string_buffer(props_size)
-            props = ctypes.cast(buf, ctypes.POINTER(EVENT_TRACE_PROPERTIES)).contents
-            props.Wnode_BufferSize = props_size
-            self._advapi32.ControlTraceW(self.session_handle, self.session_name, ctypes.byref(props), 1)
+            buf, ptr = _make_props_buffer(self.session_name)
+            self._advapi32.ControlTraceW(
+                self.session_handle,
+                self.session_name,
+                ptr,
+                EVENT_TRACE_CONTROL_STOP
+            )
+            log.info("ETW session stopped.")
+        if self.trace_handle:
+            self._advapi32.CloseTrace(self.trace_handle)
 
 
 # ---------------------------------------------------------
@@ -295,8 +450,8 @@ def get_pids_by_names(names):
         try:
             proc_name = proc.info["name"]
             if proc_name:
-                clean_proc_name = proc_name.lower().replace(".exe", "")
-                if clean_proc_name in names_clean:
+                clean = proc_name.lower().replace(".exe", "")
+                if clean in names_clean:
                     matching_pids.add(proc.info["pid"])
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
@@ -312,46 +467,49 @@ def get_max_ram(pid: int) -> int:
 # ---------------------------------------------------------
 
 def partition_to_continious_rv_custom_dynamic(
-    pid: int, current_val_kb: float, max_system_ram_kb: float
+    pid: int, current_val_gb: float, max_system_ram_gb: float
 ):
-    dynamic_upper_kb = min(
-        max_system_ram_kb, max(128 * 1024, current_val_kb * 1.5)
+    dynamic_upper_gb = min(
+        max_system_ram_gb, max(0.128, current_val_gb * 1.5)
     )
 
-    dynamic_upper_mb = dynamic_upper_kb / 1024
-    dynamic_upper_gb = dynamic_upper_mb / 1024
-
-    if dynamic_upper_mb <= 128:
+    if dynamic_upper_gb <= 0.128:
         num_bins = 64
-    elif dynamic_upper_mb <= 512:
+    elif dynamic_upper_gb <= 0.512:
         num_bins = 100
-    elif dynamic_upper_gb < 1.0:
-        num_bins = 100
+    elif dynamic_upper_gb <= 4.0:
+        num_bins = 64
+    elif dynamic_upper_gb <= 32.0:
+        num_bins = 32
     else:
-        num_bins = 16 if dynamic_upper_gb > 32 else 8
+        num_bins = 16
 
-    lower_kb = 0.0
-    step     = (dynamic_upper_kb - lower_kb) / num_bins
-    edges    = [lower_kb + i * step for i in range(num_bins + 1)]
+    lower_gb = 0.0
+    step     = (dynamic_upper_gb - lower_gb) / num_bins
+    edges    = [lower_gb + i * step for i in range(num_bins + 1)]
 
     return (
-        [ContiniousRandomVariable(i, edges[i], edges[i + 1]) for i in range(num_bins)],
+        [ContiniousRandomVariable(f"bin_{i}", edges[i], edges[i + 1]) for i in range(num_bins)],
         num_bins,
     )
 
 
+# ---------------------------------------------------------
+# Single Metric Process Histogram Container
+# ---------------------------------------------------------
+
 class ProcessHistogram:
 
-    def __init__(self, pid: int, max_system_ram_kb: float):
+    def __init__(self, pid: int, metric_name: str, max_system_ram_kb: float):
         self.pid               = pid
-        self.max_system_ram_kb = max_system_ram_kb
-        self.samples           = {"malloc": [], "free": []}
+        self.metric_name       = metric_name
+        self.max_system_ram_gb = max_system_ram_kb / (1024.0 * 1024.0)
+        self.samples           = []
         self.sample_count      = 0
-        self.last_distribution = {"malloc": None, "free": None}
+        self.last_distribution = None
 
-    def record(self, event_type: str, size_kb: float):
-        if event_type in self.samples:
-            self.samples[event_type].append(size_kb)
+    def record(self, size_gb: float):
+        self.samples.append(size_gb)
 
     def increment_sample(self):
         self.sample_count += 1
@@ -359,92 +517,36 @@ class ProcessHistogram:
     def is_window_complete(self) -> bool:
         return self.sample_count >= SAMPLES_PER_WINDOW
 
-    def _build_dist(self, key: str):
-        data = self.samples[key]
-        if not data:
+    def build_distribution(self):
+        if not self.samples:
             return None
 
-        peak_val = max(data)
+        peak_val = max(self.samples)
         bins, num_bins = partition_to_continious_rv_custom_dynamic(
-            self.pid, peak_val, self.max_system_ram_kb
+            self.pid, peak_val, self.max_system_ram_gb
         )
 
-        frequencies = [0] * num_bins
-        for val in data:
+        frequencies = [0.0] * num_bins
+        for val in self.samples:
             placed = False
             for i, crv in enumerate(bins):
                 if crv.getLower() <= val < crv.getUpper():
-                    frequencies[i] += 1
+                    frequencies[i] += 1.0
                     placed = True
                     break
             if not placed:
-                frequencies[-1] += 1
+                frequencies[-1] += 1.0
 
-        return ContiniousDistribution(
-            f"Heap {key.capitalize()} Distribution PID {self.pid}",
+        self.last_distribution = ContiniousDistribution(
+            f"PID {self.pid} {self.metric_name} Distribution",
             bins,
             frequencies,
         )
-
-    def get_distributions(self):
-        dist_malloc = self._build_dist("malloc")
-        dist_free   = self._build_dist("free")
-        
-        self.last_distribution = {"malloc": dist_malloc, "free": dist_free}
         return self.last_distribution
 
     def reset_counts(self):
-        self.samples      = {"malloc": [], "free": []}
+        self.samples      = []
         self.sample_count = 0
-
-
-# ---------------------------------------------------------
-# Heap Graph Data Container
-# ---------------------------------------------------------
-
-class ProcessRAM_Graph:
-
-    KB_TO_GB = 1024.0 * 1024.0
-
-    def __init__(self, pid: int, name: str):
-        self.pid         = pid
-        self.proc_name   = name
-        self.time_points = []
-        
-        self.mallocSize  = []
-        self.freeSize    = []
-
-    def add_malloc_event(self, time_ns: int, size_bytes: float):
-        size_kb = size_bytes / 1024.0
-        self.time_points.append(float(time_ns))
-        self.mallocSize.append(size_kb / self.KB_TO_GB)
-        self.freeSize.append(0.0)
-
-    def add_free_event(self, time_ns: int, size_bytes: float):
-        freed_kb = size_bytes / 1024.0
-        self.time_points.append(float(time_ns))
-        self.mallocSize.append(0.0)
-        self.freeSize.append(freed_kb / self.KB_TO_GB)
-
-    def has_data(self) -> bool:
-        return len(self.time_points) > 0
-
-    @staticmethod
-    def compute_kinematics(series, time_points):
-        if len(series) < 2:
-            return [0.0] * len(series), [0.0] * len(series)
-
-        vels = [0.0]
-        for j in range(1, len(series)):
-            dt = (time_points[j] - time_points[j - 1]) / 1e9
-            vels.append((series[j] - series[j - 1]) / dt if dt > 0 else 0.0)
-
-        accs = [0.0]
-        for j in range(1, len(vels)):
-            dt = (time_points[j] - time_points[j - 1]) / 1e9
-            accs.append((vels[j] - vels[j - 1]) / dt if dt > 0 else 0.0)
-
-        return vels, accs
 
 
 # ---------------------------------------------------------
@@ -622,7 +724,6 @@ class DATABASE_INTEGRATION:
 
     def _render_interactive(self, fig):
         import matplotlib.pyplot as plt
-
         try:
             plt.ion()
             fig.show()
@@ -730,14 +831,14 @@ class Commands:
         tokens = cmd.split()
 
         if cmd.startswith("monitor --live figshow"):
-            mode = "size"
+            mode       = "size"
             sub_tokens = tokens[3:]
 
             if sub_tokens and sub_tokens[0] == "--vel":
-                mode = "velocity"
+                mode       = "velocity"
                 sub_tokens = sub_tokens[1:]
             elif sub_tokens and sub_tokens[0] == "--acc":
-                mode = "acceleration"
+                mode       = "acceleration"
                 sub_tokens = sub_tokens[1:]
 
             target_pids = []
@@ -773,6 +874,8 @@ STATE_UPDATE_DATABASE = 3
 
 class Monitor:
 
+    BYTES_TO_GB = 1024.0 * 1024.0 * 1024.0
+
     def __init__(self, filt):
         self.filter        = filt
         self.previous_cpu  = {}
@@ -783,10 +886,20 @@ class Monitor:
 
         self.target_pids = filt.get_target_pids()
 
-        self.fsm_state  = {}
-        self.ram_max    = {}
-        self.histograms = {}
-        self.RAM_graph  = {}
+        self.fsm_state = {}
+        self.ram_max   = {}
+
+        # Dictionaries mapping PID -> {"x": deque(), "y": deque()}
+        self.RAM_graph     = {}
+        self.ALLOC_graph   = {}
+        self.DEALLOC_graph = {}
+
+        # Dictionaries mapping PID -> ProcessHistogram
+        self.RAM_hist     = {}
+        self.ALLOC_hist   = {}
+        self.DEALLOC_hist = {}
+
+        self._pid_lock = threading.Lock()
 
         self.live_plot_active = False
         self.live_plot_mode   = "size"
@@ -795,8 +908,8 @@ class Monitor:
         self.axes             = None
         self.active_db_fig    = None
 
-        self.db_plot_requests = queue.Queue()
-        self.db_integration   = DATABASE_INTEGRATION(time_period_save_to_memory=DATABASE_REFRESH)
+        self.db_plot_requests   = queue.Queue()
+        self.db_integration     = DATABASE_INTEGRATION(time_period_save_to_memory=DATABASE_REFRESH)
         self.last_db_flush_time = {}
 
         self.etw_consumer = NativeETWConsumer(
@@ -805,52 +918,67 @@ class Monitor:
         )
         self.etw_consumer.start()
 
+    def _init_pid(self, pid: int, name: str) -> bool:
+        ram_max_kb = get_max_ram(pid)
+
+        self.ram_max[pid] = ram_max_kb
+
+        self.RAM_graph[pid]     = {"x": deque(maxlen=MAX_GRAPH_POINTS), "y": deque(maxlen=MAX_GRAPH_POINTS)}
+        self.ALLOC_graph[pid]   = {"x": deque(maxlen=MAX_GRAPH_POINTS), "y": deque(maxlen=MAX_GRAPH_POINTS)}
+        self.DEALLOC_graph[pid] = {"x": deque(maxlen=MAX_GRAPH_POINTS), "y": deque(maxlen=MAX_GRAPH_POINTS)}
+
+        self.RAM_hist[pid]     = ProcessHistogram(pid, "RAM RSS", ram_max_kb)
+        self.ALLOC_hist[pid]   = ProcessHistogram(pid, "RAM Allocation", ram_max_kb)
+        self.DEALLOC_hist[pid] = ProcessHistogram(pid, "RAM Deallocation", ram_max_kb)
+
+        self.fsm_state[pid] = STATE_HISTOGRAM
+        self.last_db_flush_time[pid] = time.time()
+        self.db_integration.ensure_process_exists(pid, burst_time=0.0)
+
+        # Ensure ETW consumer includes this PID
+        if hasattr(self, "etw_consumer"):
+            self.etw_consumer.add_target_pid(pid)
+
+        return True
+
     def _handle_heap_call_event(self, pid: int, event_type: str, size_bytes: int):
-        now_ns = time.time_ns()
+        now_ns  = time.time_ns()
+        size_gb = size_bytes / self.BYTES_TO_GB
 
-        if pid not in self.RAM_graph:
-            self._init_pid(pid, get_process_name(pid) or "Process")
+        with self._pid_lock:
+            if pid not in self.ALLOC_graph:
+                self._init_pid(pid, get_process_name(pid) or "Process")
 
-        graph = self.RAM_graph[pid]
-        hist  = self.histograms[pid]
+            # STRICT ETW Heap Callback Ingestion
+            if event_type == "malloc":
+                self.ALLOC_graph[pid]["x"].append(float(now_ns))
+                self.ALLOC_graph[pid]["y"].append(size_gb)
+                self.ALLOC_hist[pid].record(size_gb)
 
-        size_kb = size_bytes / 1024.0
-
-        if event_type == "malloc":
-            graph.add_malloc_event(now_ns, size_bytes)
-            hist.record("malloc", size_kb)
-        elif event_type == "free":
-            graph.add_free_event(now_ns, size_bytes)
-            hist.record("free", size_kb)
+            elif event_type == "free":
+                self.DEALLOC_graph[pid]["x"].append(float(now_ns))
+                self.DEALLOC_graph[pid]["y"].append(size_gb)
+                self.DEALLOC_hist[pid].record(size_gb)
 
     def _on_close(self, event):
         self.live_plot_active = False
-        self.fig = None
-        self.axes = None
-        self.active_db_fig = None
+        self.fig              = None
+        self.axes             = None
+        self.active_db_fig    = None
 
         import matplotlib.pyplot as plt
         plt.close("all")
         gc.collect()
 
-    def _init_pid(self, pid: int, name: str) -> bool:
-        ram_max_kb = get_max_ram(pid)
-
-        self.ram_max[pid]    = ram_max_kb
-        self.histograms[pid] = ProcessHistogram(pid, max_system_ram_kb=ram_max_kb)
-        self.RAM_graph[pid]  = ProcessRAM_Graph(pid, name)
-        self.fsm_state[pid]  = STATE_HISTOGRAM
-
-        self.last_db_flush_time[pid] = time.time()
-        self.db_integration.ensure_process_exists(pid, burst_time=0.0)
-        return True
-
     def _finalize_window(self, pid: int):
-        hist = self.histograms[pid]
-        dists = hist.get_distributions()
+        dist_ram     = self.RAM_hist[pid].build_distribution()
+        dist_alloc   = self.ALLOC_hist[pid].build_distribution()
+        dist_dealloc = self.DEALLOC_hist[pid].build_distribution()
 
-        if dists["malloc"] is None and dists["free"] is None:
-            hist.reset_counts()
+        if dist_ram is None and dist_alloc is None and dist_dealloc is None:
+            self.RAM_hist[pid].reset_counts()
+            self.ALLOC_hist[pid].reset_counts()
+            self.DEALLOC_hist[pid].reset_counts()
             self.fsm_state[pid] = STATE_HISTOGRAM
             return
 
@@ -858,47 +986,45 @@ class Monitor:
         if elapsed_since_flush >= DATABASE_REFRESH:
             self.fsm_state[pid] = STATE_UPDATE_DATABASE
         else:
-            hist.reset_counts()
+            self.RAM_hist[pid].reset_counts()
+            self.ALLOC_hist[pid].reset_counts()
+            self.DEALLOC_hist[pid].reset_counts()
             self.fsm_state[pid] = STATE_HISTOGRAM
 
     def _save_to_database(self, pid: int):
-        hist  = self.histograms.get(pid)
-        graph = self.RAM_graph.get(pid)
+        dist = (
+            self.RAM_hist[pid].last_distribution
+            or self.ALLOC_hist[pid].last_distribution
+            or self.DEALLOC_hist[pid].last_distribution
+        )
 
-        if hist is None or hist.last_distribution["malloc"] is None:
-            hist.reset_counts()
+        if dist is None:
+            self.RAM_hist[pid].reset_counts()
+            self.ALLOC_hist[pid].reset_counts()
+            self.DEALLOC_hist[pid].reset_counts()
             self.last_db_flush_time[pid] = time.time()
             self.fsm_state[pid]          = STATE_HISTOGRAM
             return
 
-        dist = hist.last_distribution["malloc"]
-
-        mean_kb     = dist.getMean()
-        variance_kb = dist.getVariance()
-        std_dev_kb  = dist.getStandardDeviation()
-        mode_kb     = dist.getMode()
-
-        KB_TO_GB    = 1024.0 * 1024.0
-        mean_gb     = mean_kb  / KB_TO_GB
-        variance_gb = variance_kb / (KB_TO_GB ** 2)
-        std_dev_gb  = std_dev_kb / KB_TO_GB
-        mode_gb     = mode_kb  / KB_TO_GB
-
-        snapshot_time = datetime.now()
+        mean_gb     = dist.getMean()
+        variance_gb = dist.getVariance()
+        std_dev_gb  = dist.getStandardDeviation()
+        mode_gb     = dist.getMode()
 
         self.db_integration.add_process_statistics(
             pid                = pid,
-            snapshot_time      = snapshot_time,
+            snapshot_time      = datetime.now(),
             mean               = mean_gb,
             variance           = variance_gb,
             standard_deviation = std_dev_gb,
             mode               = mode_gb,
         )
 
-        hist.reset_counts()
-
+        self.RAM_hist[pid].reset_counts()
+        self.ALLOC_hist[pid].reset_counts()
+        self.DEALLOC_hist[pid].reset_counts()
         self.last_db_flush_time[pid] = time.time()
-        self.fsm_state[pid] = STATE_HISTOGRAM
+        self.fsm_state[pid]          = STATE_HISTOGRAM
 
     def show_live_figures(self, target_pids: list, mode: str = "size"):
         import matplotlib.pyplot as plt
@@ -908,14 +1034,18 @@ class Monitor:
         self.live_target_pids = target_pids
         self.live_plot_mode   = mode
 
-        num_pids = min(len(target_pids), 3)
+        with self._pid_lock:
+            for pid in target_pids:
+                if pid not in self.ALLOC_graph:
+                    self._init_pid(pid, get_process_name(pid) or "Process")
+
+        num_pids = len(target_pids)
         if num_pids == 0:
             return
 
-        # 2 Subplots per PID (Malloc & Free for active mode)
         num_rows = num_pids * 2
         self.fig, self.axes = plt.subplots(num_rows, 1, figsize=(10, 3.5 * num_rows))
-        
+
         if num_rows == 1:
             self.axes = [self.axes]
         else:
@@ -936,56 +1066,50 @@ class Monitor:
 
         try:
             if force_redraw:
-                pids = self.live_target_pids[:3]
+                pids = self.live_target_pids
 
                 for i, pid in enumerate(pids):
-                    ax_malloc = self.axes[i * 2]
-                    ax_free   = self.axes[i * 2 + 1]
+                    if i * 2 + 1 >= len(self.axes):
+                        break
 
-                    ax_malloc.clear()
-                    ax_free.clear()
+                    ax_alloc   = self.axes[i * 2]
+                    ax_dealloc = self.axes[i * 2 + 1]
 
-                    graph = self.RAM_graph.get(pid)
-                    if graph and graph.has_data():
-                        t0    = graph.time_points[0]
-                        times = [(t - t0) / 1e9 for t in graph.time_points]
+                    ax_alloc.clear()
+                    ax_dealloc.clear()
 
-                        m_vels, m_accs = ProcessRAM_Graph.compute_kinematics(graph.mallocSize, graph.time_points)
-                        f_vels, f_accs = ProcessRAM_Graph.compute_kinematics(graph.freeSize, graph.time_points)
+                    proc_name = get_process_name(pid) or "Process"
+                    label     = f"{proc_name} (PID {pid})"
 
-                        label = f"{graph.proc_name} (PID {pid})"
+                    def _plot_line(ax, graph_dict, title, color):
+                        if not graph_dict or not graph_dict["x"]:
+                            ax.set_title(f"{title} — (0 ETW Events)")
+                            ax.grid(True)
+                            return
 
-                        if self.live_plot_mode == "size":
-                            ax_malloc.plot(times, graph.mallocSize, color="royalblue", linewidth=1.5, marker="o", markersize=3)
-                            ax_malloc.set_title(f"{label} — Malloc Allocation Size")
-                            ax_malloc.set_ylabel("Allocated (GB)")
+                        xs = list(graph_dict["x"])
+                        ys = list(graph_dict["y"])
+                        t0 = xs[0]
+                        times = [(t - t0) / 1e9 for t in xs]
 
-                            ax_free.plot(times, graph.freeSize, color="teal", linewidth=1.5, marker="s", markersize=3)
-                            ax_free.set_title(f"{label} — Free Deallocation Size")
-                            ax_free.set_ylabel("Deallocated (GB)")
+                        ax.plot(times, ys, color=color, linewidth=1.5, marker=".", markersize=4)
+                        ax.set_title(f"{title} ({len(xs)} ETW Events)")
+                        ax.set_ylabel("Size (GB)")
+                        ax.set_xlabel("Time (s)")
+                        ax.grid(True)
 
-                        elif self.live_plot_mode == "velocity":
-                            ax_malloc.plot(times, m_vels, color="darkorange", linewidth=1.5, marker="o", markersize=3)
-                            ax_malloc.set_title(f"{label} — Malloc Allocation Velocity")
-                            ax_malloc.set_ylabel("Velocity (GB/s)")
-
-                            ax_free.plot(times, f_vels, color="darkgreen", linewidth=1.5, marker="s", markersize=3)
-                            ax_free.set_title(f"{label} — Free Deallocation Velocity")
-                            ax_free.set_ylabel("Velocity (GB/s)")
-
-                        elif self.live_plot_mode == "acceleration":
-                            ax_malloc.plot(times, m_accs, color="crimson", linewidth=1.5, marker="o", markersize=3)
-                            ax_malloc.set_title(f"{label} — Malloc Allocation Acceleration")
-                            ax_malloc.set_ylabel("Accel (GB/s²)")
-
-                            ax_free.plot(times, f_accs, color="purple", linewidth=1.5, marker="s", markersize=3)
-                            ax_free.set_title(f"{label} — Free Deallocation Acceleration")
-                            ax_free.set_ylabel("Accel (GB/s²)")
-
-                        ax_malloc.grid(True)
-                        ax_free.grid(True)
-
-                    ax_free.set_xlabel("Time (seconds since start)")
+                    _plot_line(
+                        ax_alloc, 
+                        self.ALLOC_graph.get(pid), 
+                        f"{label} — ETW Heap Allocations (Malloc)", 
+                        "royalblue"
+                    )
+                    _plot_line(
+                        ax_dealloc, 
+                        self.DEALLOC_graph.get(pid), 
+                        f"{label} — ETW Heap Deallocations (Free)", 
+                        "crimson"
+                    )
 
                 try:
                     self.fig.tight_layout()
@@ -1047,13 +1171,23 @@ class Monitor:
 
                     latest_snapshots[pid] = snapshot
 
-                    if pid not in self.fsm_state:
-                        if not self._init_pid(pid, snapshot["name"]):
-                            continue
+                    with self._pid_lock:
+                        if pid not in self.fsm_state:
+                            self._init_pid(pid, snapshot["name"])
+
+                    # Process RSS strictly mapped to total RAM
+                    rss_gb = snapshot["rss_kb"] / (1024.0 * 1024.0)
+
+                    self.RAM_graph[pid]["x"].append(float(current_time))
+                    self.RAM_graph[pid]["y"].append(rss_gb)
+                    self.RAM_hist[pid].record(rss_gb)
 
                     if self.fsm_state[pid] == STATE_HISTOGRAM:
-                        self.histograms[pid].increment_sample()
-                        if self.histograms[pid].is_window_complete():
+                        self.RAM_hist[pid].increment_sample()
+                        self.ALLOC_hist[pid].increment_sample()
+                        self.DEALLOC_hist[pid].increment_sample()
+
+                        if self.RAM_hist[pid].is_window_complete():
                             self.fsm_state[pid] = STATE_LIVE_PLOT
 
                     if self.fsm_state[pid] == STATE_LIVE_PLOT:
@@ -1089,7 +1223,7 @@ class Monitor:
     def stop(self):
         self.running = False
         self._on_close(None)
-        if hasattr(self, 'etw_consumer'):
+        if hasattr(self, "etw_consumer"):
             self.etw_consumer.stop()
         self.db_integration.close()
 
@@ -1116,7 +1250,7 @@ def main():
     try:
         monitor.loop(args.interval)
     except KeyboardInterrupt:
-        log.info("Monitoring stopped by user")
+        log.info("Monitoring stopped by user.")
 
 
 if __name__ == "__main__":
